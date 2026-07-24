@@ -1,0 +1,4 @@
+Function ColLetterToIndex(colLetter As String) As Long
+    colLetter = UCase(Trim(colLetter))
+    ColLetterToIndex = Range(colLetter & "1").Column
+End Function

@@ -1,0 +1,178 @@
+Option Explicit
+
+Sub BuildSection_1_1_BODY_MAIN()
+
+    Dim wbMain As Workbook
+    Dim wsSources As Worksheet
+    Dim wsMapper As Worksheet
+
+    Dim wbData As Workbook
+    Dim wdApp As Object
+    Dim wdBody As Object
+
+    Dim bodyPath As String
+    Dim dataPath As String
+
+    Dim lastRow As Long
+    Dim i As Long
+    Dim numVal As Variant
+
+    Set wbMain = ThisWorkbook
+    Set wsSources = wbMain.Worksheets("Sources")
+    Set wsMapper = wbMain.Worksheets("Mapper")
+
+    ' Найти путь к шаблону BODY (Номер = 0.1)
+    lastRow = wsSources.Cells(wsSources.Rows.Count, 1).End(xlUp).Row
+    For i = 2 To lastRow
+        numVal = wsSources.Cells(i, 1).Value
+        If CStr(numVal) = "0.1" Then
+            bodyPath = wsSources.Cells(i, 4).Value   ' Путь
+            Exit For
+        End If
+    Next i
+
+    ' Найти путь к data-файлу для раздела 1 (Номер = 1)
+    For i = 2 To lastRow
+        numVal = wsSources.Cells(i, 1).Value
+        If CStr(numVal) = "1" Then
+            dataPath = wsSources.Cells(i, 4).Value   ' Путь к data1.xlsx
+            Exit For
+        End If
+    Next i
+
+    If bodyPath = "" Or dataPath = "" Then
+        MsgBox "Не найден путь к шаблону BODY или data-файлу в Sources."
+        Exit Sub
+    End If
+
+    ' Открываем data-файл
+    Set wbData = Workbooks.Open(dataPath)
+
+    ' Открываем Word и шаблон протокола
+    Set wdApp = CreateObject("Word.Application")
+    wdApp.Visible = True
+    Set wdBody = wdApp.Documents.Open(bodyPath)
+
+    ' Заливаем основную таблицу квартир BODY_MAIN
+    Call FillTable_BODY_MAIN(wbMain, wbData, wdBody)
+
+    ' По желанию: сохранить документ и закрыть data-файл
+    ' wdBody.SaveAs2 Filename:=...  ' придумать имя
+    ' wbData.Close SaveChanges:=False
+
+End Sub
+Function ColLetterToIndex(colLetter As String) As Long
+    colLetter = UCase(Trim(colLetter))
+    ColLetterToIndex = Range(colLetter & "1").Column
+End Function
+Sub FillTable_BODY_MAIN(wbMain As Workbook, wbData As Workbook, wdBody As Object)
+
+    Dim wsMapper As Worksheet
+    Dim wsData As Worksheet
+    Dim wdTable As Object
+
+    Dim firstRow As Long
+    Dim lastMapRow As Long
+    Dim r As Long
+
+    Dim excelSheetName As String
+    Dim keyColLetter As String
+    Dim startRow As Long
+    Dim keyColIdx As Long
+    Dim lastDataRow As Long
+    Dim rowCount As Long
+
+    Dim i As Long
+    Dim wordRow As Long
+
+    Set wsMapper = wbMain.Worksheets("Mapper")
+
+    ' Найти первую строку для BODY_MAIN в Mapper
+    lastMapRow = wsMapper.Cells(wsMapper.Rows.Count, 1).End(xlUp).Row
+    firstRow = 0
+
+    For r = 2 To lastMapRow
+        If wsMapper.Cells(r, 1).Value = "BODY_MAIN" Then
+            firstRow = r
+            excelSheetName = wsMapper.Cells(r, 4).Value    ' ExcelSheet
+            keyColLetter = wsMapper.Cells(r, 5).Value      ' ExcelColumnRef (буква)
+            startRow = CLng(wsMapper.Cells(r, 6).Value)    ' StartRow
+            Exit For
+        End If
+    Next r
+
+    If firstRow = 0 Then
+        MsgBox "В Mapper нет строк для BODY_MAIN."
+        Exit Sub
+    End If
+
+    ' Определяем длину данных по ключевой колонке
+    Set wsData = wbData.Worksheets(excelSheetName)
+    keyColIdx = ColLetterToIndex(keyColLetter)
+
+    lastDataRow = wsData.Cells(wsData.Rows.Count, keyColIdx).End(xlUp).Row
+    If lastDataRow < startRow Then
+        MsgBox "В листе " & excelSheetName & " нет данных для BODY_MAIN."
+        Exit Sub
+    End If
+
+    rowCount = lastDataRow - startRow + 1   ' сколько строк заливать
+
+    ' Берём таблицу квартир во втором шаблоне:
+    ' TABLE 0 – шапка, TABLE 1 – таблица квартир, TABLE 2 – подписи [file:40]
+    Set wdTable = wdBody.Tables(2)
+
+    ' Чистим старые строки данных (оставляем шапку + строку-образец)
+    Do While wdTable.Rows.Count > 2
+        wdTable.Rows(3).Delete
+    Loop
+
+    ' Убедимся, что строка-образец (2) существует
+    If wdTable.Rows.Count < 2 Then
+        wdTable.Rows.Add
+    End If
+
+    ' Добавляем строки под все данные:
+    ' первая строка данных пойдёт в уже существующую строку 2,
+    ' поэтому клонируем строку-образец (row 2) ещё (rowCount - 1) раз
+    For i = 1 To rowCount - 1
+        wdTable.Rows(2).Range.Copy
+        wdTable.Rows.Add
+    Next i
+
+    ' Заполняем таблицу
+    ' В Word: строка 1 – шапка, с 2 – данные
+    For i = 0 To rowCount - 1
+        wordRow = 2 + i
+
+        ' Колонка 1: порядковый номер (№ п.п.)
+        wdTable.Cell(wordRow, 1).Range.Text = CStr(i + 1)
+
+        ' Остальные колонки по Mapper’у (BODY_MAIN)
+        For r = 2 To lastMapRow
+            If wsMapper.Cells(r, 1).Value = "BODY_MAIN" Then
+
+                Dim colOrder As Long
+                Dim colLetter As String
+                Dim sheetName As String
+                Dim valueRow As Long
+                Dim colIdx As Long
+                Dim v As Variant
+
+                colOrder = CLng(wsMapper.Cells(r, 2).Value)    ' WordColumnOrder
+                sheetName = wsMapper.Cells(r, 4).Value          ' ExcelSheet
+                colLetter = wsMapper.Cells(r, 5).Value          ' ExcelColumnRef
+
+                Set wsData = wbData.Worksheets(sheetName)
+                colIdx = ColLetterToIndex(colLetter)
+                valueRow = startRow + i
+
+                v = wsData.Cells(valueRow, colIdx).Value
+
+                wdTable.Cell(wordRow, colOrder).Range.Text = CStr(v)
+            End If
+        Next r
+    Next i
+
+End Sub
+# protocol_macros
