@@ -1,3 +1,58 @@
+Sub RunAppendixOnly()
+
+    Dim wbMain As Workbook
+    Dim wsSources As Worksheet
+    Dim wbData As Workbook
+    Dim wdApp As Object
+    Dim wdAppx As Object
+
+    Dim appendixPath As String
+    Dim dataPath As String
+    Dim lastRow As Long
+    Dim i As Long
+    Dim numVal As Variant
+
+    Set wbMain = ThisWorkbook
+    Set wsSources = wbMain.Worksheets("Sources")
+
+    lastRow = wsSources.Cells(wsSources.Rows.Count, 1).End(xlUp).Row
+
+    For i = 2 To lastRow
+        numVal = wsSources.Cells(i, 1).Value
+        If CStr(numVal) = "0.2" Then
+            appendixPath = wsSources.Cells(i, 4).Value
+            Exit For
+        End If
+    Next i
+
+    For i = 2 To lastRow
+        numVal = wsSources.Cells(i, 1).Value
+        If CStr(numVal) = "1" Then
+            dataPath = wsSources.Cells(i, 4).Value
+            Exit For
+        End If
+    Next i
+
+    If appendixPath = "" Or dataPath = "" Then
+        MsgBox "Не найден путь к template.appendix или data-файлу"
+        Exit Sub
+    End If
+
+    Set wbData = Workbooks.Open(dataPath)
+
+    Set wdApp = CreateObject("Word.Application")
+    wdApp.Visible = True
+    Set wdAppx = wdApp.Documents.Add(Template:=appendixPath)
+
+    Call BuildSection_1_1_APPX(wbMain, wbData, wdAppx)
+
+    ' НЕ сохраняем
+    ' wdAppx.SaveAs2 ...
+
+    ' wbData.Close SaveChanges:=False
+
+End Sub
+
 ' ============================================================
 ' НОВЫЙ БЛОК — добавляется в конец модуля make_body (или в новый модуль)
 ' Не изменяет ни одну существующую Sub/Function
