@@ -1,0 +1,568 @@
+Option Explicit
+
+Sub RunAppendixOnly()
+
+    Dim wbMain As Workbook
+    Dim wsSources As Worksheet
+    Dim wbData As Workbook
+    Dim wdApp As Object
+    Dim wdAppx As Object
+
+    Dim appendixPath As String
+    Dim dataPath As String
+    Dim lastRow As Long
+    Dim i As Long
+    Dim numVal As Variant
+
+    Set wbMain = ThisWorkbook
+    Set wsSources = wbMain.Worksheets("Sources")
+
+    lastRow = wsSources.Cells(wsSources.Rows.Count, 1).End(xlUp).Row
+
+    For i = 2 To lastRow
+        numVal = wsSources.Cells(i, 1).Value
+        If Trim(CStr(numVal)) = "0.2" Then
+            appendixPath = Trim(CStr(wsSources.Cells(i, 4).Value))
+            Exit For
+        End If
+    Next i
+
+    For i = 2 To lastRow
+        numVal = wsSources.Cells(i, 1).Value
+        If Trim(CStr(numVal)) = "1" Then
+            dataPath = Trim(CStr(wsSources.Cells(i, 4).Value))
+            Exit For
+        End If
+    Next i
+
+    If appendixPath = "" Or dataPath = "" Then
+        MsgBox "Не найден путь к template.appendix или data-файлу в Sources."
+        Exit Sub
+    End If
+
+    Set wbData = Workbooks.Open(dataPath)
+
+    Set wdApp = CreateObject("Word.Application")
+    wdApp.Visible = True
+    Set wdAppx = wdApp.Documents.Add(Template:=appendixPath)
+
+    Call BuildSection_1_1_APPX(wbMain, wbData, wdAppx)
+
+    ' НЕ сохраняем
+    ' wdAppx.SaveAs2 Filename:=wbMain.Path & "\test_appendix_result.docx"
+
+    ' По желанию потом:
+    ' wbData.Close SaveChanges:=False
+
+End Sub
+
+
+Sub BuildSection_1_1_APPX(wbMain As Workbook, wbData As Workbook, wdAppx As Object)
+
+    Dim activeCats As Object
+
+    Call FillScalars_APPX_111a(wbMain, wbData, wdAppx)
+
+    Set activeCats = GetActiveCategories(wbMain, wbData)
+
+    Call FillTable_APPX_111b(wdAppx, activeCats)
+    Call FillTable_APPX_112(wbMain, wbData, wdAppx, activeCats)
+    Call FillTable_APPX_113a(wbMain, wbData, wdAppx)
+    Call FillTable_APPX_113b(wbMain, wbData, wdAppx)
+    Call FillTable_APPX_114(wbMain, wbData, wdAppx)
+
+End Sub
+
+
+Sub FillScalars_APPX_111a(wbMain As Workbook, wbData As Workbook, wdDoc As Object)
+
+    Dim placeholders As Variant
+    Dim i As Long
+    Dim ph As String
+    Dim v As String
+
+    placeholders = Array("{{ОКРУГ}}", "{{РАЙОН}}", "{{АДРЕС}}")
+
+    For i = LBound(placeholders) To UBound(placeholders)
+        ph = CStr(placeholders(i))
+        v = GetDataScalarByPlaceholder(wbMain, wbData, ph)
+        Call ReplacePlaceholderInWord(wdDoc, ph, v)
+    Next i
+
+End Sub
+
+
+Function GetActiveCategories(wbMain As Workbook, wbData As Workbook) As Object
+
+    Dim wsMapper As Worksheet
+    Dim result As Object
+
+    Dim catCodes As Variant
+    Dim i As Long
+    Dim ph As String
+    Dim v As String
+
+    Set result = CreateObject("Scripting.Dictionary")
+    Set wsMapper = wbMain.Worksheets("Mapper")
+
+    catCodes = Array("1К", "2К", "3К", "4К", "5К", "1Е", "2Е", "3Е", "4Е", "5Е", "СТ")
+
+    For i = LBound(catCodes) To UBound(catCodes)
+        ph = "{{" & CStr(catCodes(i)) & "}}"
+        v = GetDataScalarByPlaceholder(wbMain, wbData, ph)
+
+        If Trim(v) <> "" Then
+            If IsNumeric(v) Then
+                If CDbl(v) <> 0 Then
+                    If Not result.Exists(CStr(catCodes(i))) Then
+                        result.Add CStr(catCodes(i)), CDbl(v)
+                    End If
+                End If
+            End If
+        End If
+    Next i
+
+    Set GetActiveCategories = result
+
+End Function
+
+
+Sub FillTable_APPX_111b(wdDoc As Object, activeCats As Object)
+
+    Dim wdTable As Object
+    Dim r As Long
+    Dim catCode As String
+    Dim ph As String
+
+    Set wdTable = wdDoc.Tables(2)
+
+    For r = wdTable.Rows.Count To 1 Step -1
+        catCode = ExtractCategoryCodeFromRow(wdTable, r, 2)
+
+        If catCode <> "" Then
+            If Not activeCats.Exists(catCode) Then
+                wdTable.Rows(r).Delete
+            Else
+                ph = "{{" & catCode & "}}"
+                Call ReplacePlaceholderInWord(wdDoc, ph, Format(activeCats(catCode), "#,##0"))
+            End If
+        End If
+    Next r
+
+End Sub
+
+
+Function ExtractCategoryCodeFromRow(wdTable As Object, rowIndex As Long, colIndex As Long) As String
+
+    Dim t As String
+    Dim p1 As Long
+    Dim p2 As Long
+
+    t = wdTable.Cell(rowIndex, colIndex).Range.Text
+    t = Replace(t, Chr(13), "")
+    t = Replace(t, Chr(7), "")
+
+    p1 = InStr(1, t, "{{")
+    p2 = InStr(1, t, "}}")
+
+    If p1 > 0 And p2 > p1 Then
+        ExtractCategoryCodeFromRow = Mid$(t, p1 + 2, p2 - p1 - 2)
+    Else
+        ExtractCategoryCodeFromRow = ""
+    End If
+
+End Function
+
+
+Sub FillTable_APPX_112(wbMain As Workbook, wbData As Workbook, wdDoc As Object, activeCats As Object)
+
+    Dim wsMapper As Worksheet
+    Dim wsData As Worksheet
+    Dim wdTable As Object
+
+    Dim firstRow As Long
+    Dim lastMapRow As Long
+    Dim r As Long
+
+    Dim excelSheetName As String
+    Dim keyColLetter As String
+    Dim startRow As Long
+    Dim keyColIdx As Long
+    Dim lastDataRow As Long
+    Dim rowCount As Long
+
+    Dim i As Long
+    Dim wordRow As Long
+
+    Dim cat As Variant
+    Dim ph As String
+    Dim catCode As String
+
+    Set wsMapper = wbMain.Worksheets("Mapper")
+    lastMapRow = wsMapper.Cells(wsMapper.Rows.Count, 1).End(xlUp).Row
+    firstRow = 0
+
+    For r = 2 To lastMapRow
+        If Trim(CStr(wsMapper.Cells(r, 1).Value)) = "APPX_112" Then
+            firstRow = r
+            excelSheetName = Trim(CStr(wsMapper.Cells(r, 4).Value))
+            keyColLetter = Trim(CStr(wsMapper.Cells(r, 5).Value))
+            startRow = CLng(wsMapper.Cells(r, 6).Value)
+            Exit For
+        End If
+    Next r
+
+    If firstRow = 0 Then
+        MsgBox "В Mapper нет строк для APPX_112."
+        Exit Sub
+    End If
+
+    Set wsData = wbData.Worksheets(excelSheetName)
+    keyColIdx = ColLetterToIndex(keyColLetter)
+    lastDataRow = wsData.Cells(wsData.Rows.Count, keyColIdx).End(xlUp).Row
+
+    If lastDataRow < startRow Then
+        MsgBox "В листе " & excelSheetName & " нет данных для APPX_112."
+        Exit Sub
+    End If
+
+    rowCount = lastDataRow - startRow + 1
+
+    Set wdTable = wdDoc.Tables(3)
+
+    For r = wdTable.Rows.Count To 1 Step -1
+        catCode = ExtractCategoryCodeFromRow(wdTable, r, 7)
+        If catCode <> "" Then
+            If Not activeCats.Exists(catCode) Then
+                wdTable.Rows(r).Delete
+            End If
+        End If
+    Next r
+
+    Do While wdTable.Rows.Count > 2
+        catCode = ExtractCategoryCodeFromRow(wdTable, 3, 7)
+        If catCode <> "" Then Exit Do
+        wdTable.Rows(3).Delete
+    Loop
+
+    If wdTable.Rows.Count < 2 Then
+        MsgBox "В таблице APPX_112 не найдена строка-образец."
+        Exit Sub
+    End If
+
+    For i = 1 To rowCount - 1
+        wdTable.Rows(2).Range.Copy
+        wdTable.Rows.Add
+    Next i
+
+    For i = 0 To rowCount - 1
+        wordRow = 2 + i
+
+        For r = 2 To lastMapRow
+            If Trim(CStr(wsMapper.Cells(r, 1).Value)) = "APPX_112" Then
+
+                Dim colOrder As Long
+                Dim colLetter As String
+                Dim sheetName As String
+                Dim valueRow As Long
+                Dim colIdx As Long
+
+                colOrder = CLng(wsMapper.Cells(r, 2).Value)
+                sheetName = Trim(CStr(wsMapper.Cells(r, 4).Value))
+                colLetter = Trim(CStr(wsMapper.Cells(r, 5).Value))
+
+                Set wsData = wbData.Worksheets(sheetName)
+                colIdx = ColLetterToIndex(colLetter)
+                valueRow = startRow + i
+
+                wdTable.Cell(wordRow, colOrder).Range.Text = wsData.Cells(valueRow, colIdx).Text
+            End If
+        Next r
+    Next i
+
+    For Each cat In activeCats.Keys
+        ph = "{{" & CStr(cat) & "}}"
+        Call ReplacePlaceholderInWord(wdDoc, ph, Format(activeCats(cat), "#,##0"))
+    Next cat
+
+End Sub
+
+
+Sub FillTable_APPX_113a(wbMain As Workbook, wbData As Workbook, wdDoc As Object)
+
+    Dim wsMapper As Worksheet
+    Dim wsData As Worksheet
+    Dim wdTable As Object
+
+    Dim lastMapRow As Long
+    Dim r As Long
+
+    Dim firstRow As Long
+    Dim excelSheetName As String
+    Dim startRow As Long
+    Dim keyColLetter As String
+    Dim keyColIdx As Long
+    Dim lastDataRow As Long
+
+    Dim rowCount As Long
+    Dim i As Long
+    Dim wordRow As Long
+
+    Set wsMapper = wbMain.Worksheets("Mapper")
+    lastMapRow = wsMapper.Cells(wsMapper.Rows.Count, 1).End(xlUp).Row
+    firstRow = 0
+
+    For r = 2 To lastMapRow
+        If Trim(CStr(wsMapper.Cells(r, 1).Value)) = "APPX_113a" Then
+            firstRow = r
+            excelSheetName = Trim(CStr(wsMapper.Cells(r, 4).Value))
+            keyColLetter = Trim(CStr(wsMapper.Cells(r, 5).Value))
+            startRow = CLng(wsMapper.Cells(r, 6).Value)
+            Exit For
+        End If
+    Next r
+
+    If firstRow = 0 Then
+        Exit Sub
+    End If
+
+    Set wsData = wbData.Worksheets(excelSheetName)
+    keyColIdx = ColLetterToIndex(keyColLetter)
+    lastDataRow = wsData.Cells(wsData.Rows.Count, keyColIdx).End(xlUp).Row
+
+    If lastDataRow < startRow Then Exit Sub
+
+    rowCount = lastDataRow - startRow + 1
+
+    Set wdTable = wdDoc.Tables(4)
+
+    If wdTable.Rows.Count < 2 Then Exit Sub
+
+    For i = 0 To rowCount - 1
+        wordRow = 2 + i
+
+        If wordRow > wdTable.Rows.Count Then Exit For
+
+        For r = 2 To lastMapRow
+            If Trim(CStr(wsMapper.Cells(r, 1).Value)) = "APPX_113a" Then
+
+                Dim colOrder As Long
+                Dim colLetter As String
+                Dim sheetName As String
+                Dim valueRow As Long
+                Dim colIdx As Long
+
+                colOrder = CLng(wsMapper.Cells(r, 2).Value)
+                sheetName = Trim(CStr(wsMapper.Cells(r, 4).Value))
+                colLetter = Trim(CStr(wsMapper.Cells(r, 5).Value))
+
+                Set wsData = wbData.Worksheets(sheetName)
+                colIdx = ColLetterToIndex(colLetter)
+                valueRow = startRow + i
+
+                wdTable.Cell(wordRow, colOrder).Range.Text = wsData.Cells(valueRow, colIdx).Text
+            End If
+        Next r
+    Next i
+
+End Sub
+
+
+Sub FillTable_APPX_113b(wbMain As Workbook, wbData As Workbook, wdDoc As Object)
+
+    Dim wsMapper As Worksheet
+    Dim wsData As Worksheet
+    Dim wdTable As Object
+
+    Dim lastMapRow As Long
+    Dim r As Long
+
+    Dim firstRow As Long
+    Dim excelSheetName As String
+    Dim keyColLetter As String
+    Dim startRow As Long
+    Dim keyColIdx As Long
+    Dim lastDataRow As Long
+    Dim rowCount As Long
+
+    Dim i As Long
+    Dim wordRow As Long
+
+    Dim footerRow1 As Long
+    Dim footerRow2 As Long
+    Dim footerRow3 As Long
+
+    Dim sumZ As Double
+    Dim sumAF As Double
+    Dim sumAI As Double
+
+    Set wsMapper = wbMain.Worksheets("Mapper")
+    lastMapRow = wsMapper.Cells(wsMapper.Rows.Count, 1).End(xlUp).Row
+    firstRow = 0
+
+    For r = 2 To lastMapRow
+        If Trim(CStr(wsMapper.Cells(r, 1).Value)) = "APPX_113b" Then
+            firstRow = r
+            excelSheetName = Trim(CStr(wsMapper.Cells(r, 4).Value))
+            keyColLetter = Trim(CStr(wsMapper.Cells(r, 5).Value))
+            startRow = CLng(wsMapper.Cells(r, 6).Value)
+            Exit For
+        End If
+    Next r
+
+    If firstRow = 0 Then Exit Sub
+
+    Set wsData = wbData.Worksheets(excelSheetName)
+    keyColIdx = ColLetterToIndex(keyColLetter)
+    lastDataRow = wsData.Cells(wsData.Rows.Count, keyColIdx).End(xlUp).Row
+
+    If lastDataRow < startRow Then Exit Sub
+
+    rowCount = lastDataRow - startRow + 1
+
+    Set wdTable = wdDoc.Tables(5)
+
+    For i = 1 To rowCount - 1
+        wdTable.Rows(3).Range.Copy
+        wdTable.Rows.Add
+    Next i
+
+    For i = 0 To rowCount - 1
+        wordRow = 3 + i
+
+        For r = 2 To lastMapRow
+            If Trim(CStr(wsMapper.Cells(r, 1).Value)) = "APPX_113b" Then
+
+                Dim colOrder As Long
+                Dim colLetter As String
+                Dim sheetName As String
+                Dim valueRow As Long
+                Dim colIdx As Long
+
+                colOrder = CLng(wsMapper.Cells(r, 2).Value)
+                sheetName = Trim(CStr(wsMapper.Cells(r, 4).Value))
+                colLetter = Trim(CStr(wsMapper.Cells(r, 5).Value))
+
+                Set wsData = wbData.Worksheets(sheetName)
+                colIdx = ColLetterToIndex(colLetter)
+                valueRow = startRow + i
+
+                wdTable.Cell(wordRow, colOrder).Range.Text = wsData.Cells(valueRow, colIdx).Text
+            End If
+        Next r
+    Next i
+
+    footerRow1 = 3 + rowCount
+    footerRow2 = footerRow1 + 1
+    footerRow3 = footerRow2 + 1
+
+    sumZ = SumColumnByLetter(wsData, "Z", startRow, lastDataRow)
+    sumAF = SumColumnByLetter(wsData, "AF", startRow, lastDataRow)
+    sumAI = SumColumnByLetter(wsData, "AI", startRow, lastDataRow)
+
+    wdTable.Cell(footerRow1, 22).Range.Text = Format(sumZ, "#,##0")
+    wdTable.Cell(footerRow2, 26).Range.Text = Format(sumAF, "#,##0")
+    wdTable.Cell(footerRow3, 29).Range.Text = Format(sumAI, "#,##0")
+
+End Sub
+
+
+Sub FillTable_APPX_114(wbMain As Workbook, wbData As Workbook, wdDoc As Object)
+
+    Dim wsMapper As Worksheet
+    Dim wsData As Worksheet
+    Dim wdTable As Object
+
+    Dim lastMapRow As Long
+    Dim r As Long
+
+    Dim firstRow As Long
+    Dim excelSheetName As String
+    Dim keyColLetter As String
+    Dim startRow As Long
+    Dim keyColIdx As Long
+    Dim lastDataRow As Long
+    Dim rowCount As Long
+
+    Dim i As Long
+    Dim wordRow As Long
+
+    Set wsMapper = wbMain.Worksheets("Mapper")
+    lastMapRow = wsMapper.Cells(wsMapper.Rows.Count, 1).End(xlUp).Row
+    firstRow = 0
+
+    For r = 2 To lastMapRow
+        If Trim(CStr(wsMapper.Cells(r, 1).Value)) = "APPX_114" Then
+            firstRow = r
+            excelSheetName = Trim(CStr(wsMapper.Cells(r, 4).Value))
+            keyColLetter = Trim(CStr(wsMapper.Cells(r, 5).Value))
+            startRow = CLng(wsMapper.Cells(r, 6).Value)
+            Exit For
+        End If
+    Next r
+
+    If firstRow = 0 Then Exit Sub
+
+    Set wsData = wbData.Worksheets(excelSheetName)
+    keyColIdx = ColLetterToIndex(keyColLetter)
+    lastDataRow = wsData.Cells(wsData.Rows.Count, keyColIdx).End(xlUp).Row
+
+    If lastDataRow < startRow Then Exit Sub
+
+    rowCount = lastDataRow - startRow + 1
+
+    Set wdTable = wdDoc.Tables(6)
+
+    For i = 1 To rowCount - 1
+        wdTable.Rows(3).Range.Copy
+        wdTable.Rows.Add
+    Next i
+
+    For i = 0 To rowCount - 1
+        wordRow = 3 + i
+
+        For r = 2 To lastMapRow
+            If Trim(CStr(wsMapper.Cells(r, 1).Value)) = "APPX_114" Then
+
+                Dim colOrder As Long
+                Dim colLetter As String
+                Dim sheetName As String
+                Dim valueRow As Long
+                Dim colIdx As Long
+
+                colOrder = CLng(wsMapper.Cells(r, 2).Value)
+                sheetName = Trim(CStr(wsMapper.Cells(r, 4).Value))
+                colLetter = Trim(CStr(wsMapper.Cells(r, 5).Value))
+
+                Set wsData = wbData.Worksheets(sheetName)
+                colIdx = ColLetterToIndex(colLetter)
+                valueRow = startRow + i
+
+                wdTable.Cell(wordRow, colOrder).Range.Text = wsData.Cells(valueRow, colIdx).Text
+            End If
+        Next r
+    Next i
+
+End Sub
+
+
+Function SumColumnByLetter(wsData As Worksheet, colLetter As String, startRow As Long, lastRow As Long) As Double
+
+    Dim r As Long
+    Dim colIdx As Long
+    Dim v As Variant
+    Dim total As Double
+
+    colIdx = ColLetterToIndex(colLetter)
+    total = 0
+
+    For r = startRow To lastRow
+        v = wsData.Cells(r, colIdx).Value
+        If IsNumeric(v) Then
+            total = total + CDbl(v)
+        End If
+    Next r
+
+    SumColumnByLetter = total
+
+End Function
