@@ -1,0 +1,316 @@
+' ============================================================
+' НОВЫЙ БЛОК — добавляется в конец модуля make_body (или в новый модуль)
+' Не изменяет ни одну существующую Sub/Function
+' ============================================================
+
+Sub BuildSection_1_1_APPX(wbMain As Workbook, wbData As Workbook, wdAppx As Object)
+
+    ' Table(1) в Word = APPX_111a (шапка: округ/район/адрес)
+    Call FillScalars_APPX_111a(wbMain, wbData, wdAppx)
+
+    ' Table(2) = APPX_111b (список категорий квартир с итоговыми суммами)
+    ' Table(3) = APPX_112 (аналоги-аукционы, построчно + подвал по категориям)
+    ' Обе синхронизированы, поэтому считаем "активные категории" один раз
+    Dim activeCats As Object
+    Set activeCats = GetActiveCategories(wbMain, wbData)
+
+    Call FillTable_APPX_111b(wbMain, wbData, wdAppx, activeCats)
+    Call FillTable_APPX_112(wbMain, wbData, wdAppx, activeCats)
+
+    ' Table(4) = APPX_113a
+    Call FillTable_APPX_113a(wbMain, wbData, wdAppx)
+
+    ' Table(5) = APPX_113b (контент с 3-й строки + 3 суммы в подвале)
+    Call FillTable_APPX_113b(wbMain, wbData, wdAppx)
+
+    ' Table(6) = APPX_114 (контент с 3-й строки)
+    Call FillTable_APPX_114(wbMain, wbData, wdAppx)
+
+End Sub
+
+Sub FillScalars_APPX_111a(wbMain As Workbook, wbData As Workbook, wdDoc As Object)
+
+    Dim placeholders As Variant
+    Dim i As Long
+    Dim ph As String
+    Dim v As String
+
+    placeholders = Array("{{ОКРУГ}}", "{{РАЙОН}}", "{{АДРЕС}}")
+
+    For i = LBound(placeholders) To UBound(placeholders)
+        ph = placeholders(i)
+        v = GetDataScalarByPlaceholder(wbMain, wbData, ph)
+        Call ReplacePlaceholderInWord(wdDoc, ph, v)
+    Next i
+
+End Sub
+
+
+Function GetActiveCategories(wbMain As Workbook, wbData As Workbook) As Object
+
+    Dim wsMapper As Worksheet
+    Dim wsData As Worksheet
+    Dim result As Object
+    Set result = CreateObject("Scripting.Dictionary")
+
+    Dim catCodes As Variant
+    catCodes = Array("1К", "2К", "3К", "4К", "5К", "1Е", "2Е", "3Е", "4Е", "5Е", "СТ")
+
+    Dim i As Long, ph As String, sheetName As String, cellRef As String
+    Dim wsMapperPhCol As Long, wsMapperSheetCol As Long, wsMapperRefCol As Long
+    Dim r As Long, lastRow As Long
+    Dim v As Variant
+
+    Set wsMapper = wbMain.Worksheets("Mapper")
+    wsMapperPhCol = FindHeaderColumn(wsMapper, "Placeholder")
+    wsMapperSheetCol = FindHeaderColumn(wsMapper, "ExcelSheet")
+    wsMapperRefCol = FindHeaderColumn(wsMapper, "ExcelColumnRef")
+    lastRow = wsMapper.Cells(wsMapper.Rows.Count, wsMapperPhCol).End(xlUp).Row
+
+    For i = LBound(catCodes) To UBound(catCodes)
+        ph = "{{" & catCodes(i) & "}}"
+
+        For r = 2 To lastRow
+            If Trim(CStr(wsMapper.Cells(r, wsMapperPhCol).value)) = ph Then
+                sheetName = Trim(CStr(wsMapper.Cells(r, wsMapperSheetCol).value))
+                cellRef = Trim(CStr(wsMapper.Cells(r, wsMapperRefCol).value))
+                Set wsData = wbData.Worksheets(sheetName)
+                v = wsData.Range(cellRef).value
+
+                If IsNumeric(v) And v <> 0 Then
+                    result.Add catCodes(i), CDbl(v)
+                End If
+                Exit For
+            End If
+        Next r
+    Next i
+
+    Set GetActiveCategories = result
+
+End Function
+
+Sub FillTable_APPX_111b(wbMain As Workbook, wbData As Workbook, wdDoc As Object, activeCats As Object)
+
+    Dim wdTable As Object
+    Dim r As Long
+    Dim catCode As String
+    Dim ph As String
+
+    Set wdTable = wdDoc.Tables(2)   ' проверить реальный индекс таблицы в этом шаблоне
+
+    ' Идём с конца, чтобы удаление не сбивало индексы
+    For r = wdTable.Rows.Count To 1 Step -1
+        catCode = ExtractCategoryCodeFromRow(wdTable, r)   ' см. ниже
+        If catCode <> "" Then
+            If Not activeCats.Exists(catCode) Then
+                wdTable.Rows(r).Delete
+            Else
+                ph = "{{" & catCode & "}}"
+                Call ReplacePlaceholderInWord(wdDoc, ph, Format(activeCats(catCode), "#,##0"))
+            End If
+        End If
+    Next r
+
+End Sub
+
+Function ExtractCategoryCodeFromRow(wdTable As Object, r As Long) As String
+    Dim t As String
+    t = wdTable.Cell(r, 2).Range.Text   ' столбец с {{1К}} и т.п. до замены
+    t = Replace(Replace(t, Chr(13), ""), Chr(7), "")
+    If InStr(t, "{{") > 0 Then
+        ExtractCategoryCodeFromRow = Mid(t, InStr(t, "{{") + 2, InStr(t, "}}") - InStr(t, "{{") - 2)
+    Else
+        ExtractCategoryCodeFromRow = ""
+    End If
+End Function
+
+Sub FillTable_APPX_112(wbMain As Workbook, wbData As Workbook, wdDoc As Object, activeCats As Object)
+
+    Dim wsMapper As Worksheet, wsData As Worksheet
+    Dim wdTable As Object
+    Dim firstRow As Long, lastMapRow As Long, r As Long
+    Dim excelSheetName As String, keyColLetter As String
+    Dim startRow As Long, keyColIdx As Long, lastDataRow As Long, rowCount As Long
+    Dim i As Long, wordRow As Long
+
+    Set wsMapper = wbMain.Worksheets("Mapper")
+    lastMapRow = wsMapper.Cells(wsMapper.Rows.Count, 1).End(xlUp).Row
+    firstRow = 0
+
+    For r = 2 To lastMapRow
+        If wsMapper.Cells(r, 1).value = "APPX_112" Then
+            firstRow = r
+            excelSheetName = wsMapper.Cells(r, 4).value
+            keyColLetter = wsMapper.Cells(r, 5).value
+            startRow = CLng(wsMapper.Cells(r, 6).value)
+            Exit For
+        End If
+    Next r
+    If firstRow = 0 Then Exit Sub
+
+    Set wsData = wbData.Worksheets(excelSheetName)
+    keyColIdx = ColLetterToIndex(keyColLetter)
+    lastDataRow = wsData.Cells(wsData.Rows.Count, keyColIdx).End(xlUp).Row
+    If lastDataRow < startRow Then Exit Sub
+    rowCount = lastDataRow - startRow + 1
+
+    Set wdTable = wdDoc.Tables(3)   ' проверить реальный индекс
+
+    ' ---- ШАГ 1: удаляем неактивные итоговые строки подвала ----
+    ' Подвал считаем как последние N строк таблицы (после шапки/образца),
+    ' в них ищем плейсхолдер {{XX}} и сверяем с activeCats
+    Dim footerCatCodes As Variant
+    footerCatCodes = Array("1К", "2К", "3К", "4К", "5К", "1Е", "2Е", "3Е", "4Е", "5Е", "СТ")
+
+    For r = wdTable.Rows.Count To 1 Step -1
+        Dim catCode As String
+        catCode = ExtractCategoryCodeFromRow(wdTable, r)
+        If catCode <> "" And Not IsError(Application.Match(catCode, footerCatCodes, 0)) Then
+            If Not activeCats.Exists(catCode) Then
+                wdTable.Rows(r).Delete
+            End If
+        End If
+    Next r
+
+    ' ---- ШАГ 2: клонируем строку-образец под данные (строка 2 — образец) ----
+    Do While wdTable.Rows.Count > 2 And ExtractCategoryCodeFromRow(wdTable, 3) = ""
+        wdTable.Rows(3).Delete
+    Loop
+
+    For i = 1 To rowCount - 1
+        wdTable.Rows(2).Range.Copy
+        wdTable.Rows.Add BeforeRow:=wdTable.Rows(2 + i)
+    Next i
+
+    ' ---- ШАГ 3: заполняем построчно (аналогично BODY_MAIN) ----
+    For i = 0 To rowCount - 1
+        wordRow = 2 + i
+        For r = 2 To lastMapRow
+            If wsMapper.Cells(r, 1).value = "APPX_112" Then
+                Dim colOrder As Long, colLetter As String, sheetName As String
+                Dim valueRow As Long, colIdx As Long
+
+                colOrder = CLng(wsMapper.Cells(r, 2).value)
+                sheetName = wsMapper.Cells(r, 4).value
+                colLetter = wsMapper.Cells(r, 5).value
+                Set wsData = wbData.Worksheets(sheetName)
+                colIdx = ColLetterToIndex(colLetter)
+                valueRow = startRow + i
+
+                wdTable.Cell(wordRow, colOrder).Range.Text = wsData.Cells(valueRow, colIdx).Text
+            End If
+        Next r
+    Next i
+
+    ' ---- ШАГ 4: заполняем оставшиеся (активные) итоговые строки подвала ----
+    Dim cat As Variant
+    For Each cat In activeCats.Keys
+        Dim ph As String
+        ph = "{{" & cat & "}}"
+        Call ReplacePlaceholderInWord(wdDoc, ph, Format(activeCats(cat), "#,##0"))
+    Next cat
+
+End Sub
+
+Sub FillTable_APPX_113b(wbMain As Workbook, wbData As Workbook, wdDoc As Object)
+
+    Dim wsMapper As Worksheet, wsData As Worksheet
+    Dim wdTable As Object
+    Dim lastMapRow As Long, r As Long
+    Dim excelSheetName As String, keyColLetter As String
+    Dim startRow As Long, keyColIdx As Long, lastDataRow As Long, rowCount As Long
+    Dim i As Long, wordRow As Long
+
+    Set wsMapper = wbMain.Worksheets("Mapper")
+    lastMapRow = wsMapper.Cells(wsMapper.Rows.Count, 1).End(xlUp).Row
+
+    For r = 2 To lastMapRow
+        If wsMapper.Cells(r, 1).value = "APPX_113b" Then
+            excelSheetName = wsMapper.Cells(r, 4).value
+            keyColLetter = wsMapper.Cells(r, 5).value
+            startRow = CLng(wsMapper.Cells(r, 6).value)
+            Exit For
+        End If
+    Next r
+
+    Set wsData = wbData.Worksheets(excelSheetName)
+    keyColIdx = ColLetterToIndex(keyColLetter)
+    lastDataRow = wsData.Cells(wsData.Rows.Count, keyColIdx).End(xlUp).Row
+    rowCount = lastDataRow - startRow + 1
+
+    Set wdTable = wdDoc.Tables(4)   ' проверить реальный индекс
+
+    ' Контент начинается с 3-й строки Word-таблицы (Rows(3)) —
+    ' Rows(1) и Rows(2) — двойная шапка, их не трогаем.
+    ' Строка-образец для клонирования — существующая Rows(3).
+    For i = 1 To rowCount - 1
+        wdTable.Rows(3).Range.Copy
+        wdTable.Rows.Add BeforeRow:=wdTable.Rows(3 + i)
+    Next i
+
+    For i = 0 To rowCount - 1
+        wordRow = 3 + i
+        For r = 2 To lastMapRow
+            If wsMapper.Cells(r, 1).value = "APPX_113b" Then
+                Dim colOrder As Long, colLetter As String, sheetName As String
+                Dim valueRow As Long, colIdx As Long
+
+                colOrder = CLng(wsMapper.Cells(r, 2).value)
+                sheetName = wsMapper.Cells(r, 4).value
+                colLetter = wsMapper.Cells(r, 5).value
+                Set wsData = wbData.Worksheets(sheetName)
+                colIdx = ColLetterToIndex(colLetter)
+                valueRow = startRow + i
+
+                wdTable.Cell(wordRow, colOrder).Range.Text = wsData.Cells(valueRow, colIdx).Text
+            End If
+        Next r
+    Next i
+
+    ' ---- Подвал: 3 суммы в 3-х последних строках, СТРОГО после заливки данных ----
+    ' Строки подвала теперь: (3 + rowCount) = "без скидок" (Z),
+    ' (4 + rowCount) = "неогр. круга" (AF), (5 + rowCount) = "доп. скидка" (AI)
+    Dim footerRow1 As Long, footerRow2 As Long, footerRow3 As Long
+    footerRow1 = 3 + rowCount
+    footerRow2 = footerRow1 + 1
+    footerRow3 = footerRow2 + 1
+
+    Dim sumZ As Double, sumAF As Double, sumAI As Double
+    sumZ = SumMapperColumn(wbData, wsMapper, "APPX_113b", "Z", startRow, lastDataRow)
+    sumAF = SumMapperColumn(wbData, wsMapper, "APPX_113b", "AF", startRow, lastDataRow)
+    sumAI = SumMapperColumn(wbData, wsMapper, "APPX_113b", "AI", startRow, lastDataRow)
+
+    wdTable.Cell(footerRow1, 22).Range.Text = Format(sumZ, "#,##0")   ' колонка "Итоговая стоимость помещения" (Z)
+    wdTable.Cell(footerRow2, 26).Range.Text = Format(sumAF, "#,##0")  ' "...со скидкой для неогр. круга" (AF)
+    wdTable.Cell(footerRow3, 29).Range.Text = Format(sumAI, "#,##0")  ' "...для льготных категорий" (AI)
+
+End Sub
+
+Function SumMapperColumn(wbData As Workbook, wsMapper As Worksheet, tableName As String, _
+                          colLetter As String, startRow As Long, lastRow As Long) As Double
+    Dim wsData As Worksheet
+    Dim r As Long, lastMapRow As Long
+    Dim sheetName As String, colIdx As Long, total As Double
+    Dim v As Variant
+
+    lastMapRow = wsMapper.Cells(wsMapper.Rows.Count, 1).End(xlUp).Row
+    For r = 2 To lastMapRow
+        If wsMapper.Cells(r, 1).value = tableName And wsMapper.Cells(r, 5).value = colLetter Then
+            sheetName = wsMapper.Cells(r, 4).value
+            Exit For
+        End If
+    Next r
+
+    Set wsData = wbData.Worksheets(sheetName)
+    colIdx = ColLetterToIndex(colLetter)
+
+    total = 0
+    For r = startRow To lastRow
+        v = wsData.Cells(r, colIdx).value
+        If IsNumeric(v) Then total = total + CDbl(v)
+    Next r
+
+    SumMapperColumn = total
+End Function
+
+
