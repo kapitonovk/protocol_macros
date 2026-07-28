@@ -529,77 +529,86 @@ Sub FillTable_APPX_113a(wbMain As Workbook, wbData As Workbook, wdDoc As Object)
     Dim mapFound As Boolean
 
     Dim excelSheetName As String
+    Dim keyColLetter As String
     Dim startRow As Long
-    Dim colLetter As String
-
+    Dim keyColIdx As Long
+    Dim lastDataRow As Long
     Dim rowCount As Long
+
     Dim i As Long
     Dim wordRow As Long
-    Dim colOrder As Long
 
-    Const SAMPLE_ROW As Long = 2  ' данные начинаются со 2-й строки таблицы
+    Const SAMPLE_ROW As Long = 2   ' строка 1 = шапка, данные начинаются со строки 2
 
     Set wsMapper = wbMain.Worksheets("Mapper")
     lastMapRow = wsMapper.Cells(wsMapper.Rows.Count, 2).End(xlUp).Row
+    mapFound = False
 
-    Set wdTable = wdDoc.Tables(4)
-
-    ' Сколько строк данных реально нужно залить — определяем по числу
-    ' строк-показателей в Mapper для APPX_113a (не по Excel!),
-    ' т.к. в этой таблице каждая строка Word = один показатель матрицы.
-    rowCount = 0
+    ' Берём базовые параметры блока APPX_113a из первой строки блока
     For r = 2 To lastMapRow
         If Trim(CStr(wsMapper.Cells(r, 2).Value)) = "APPX_113a" Then
-            rowCount = rowCount + 1
-        End If
-    Next r
-
-    If rowCount = 0 Then
-        MsgBox "В Mapper нет строк для APPX_113a."
-        Exit Sub
-    End If
-
-    ' Берём startRow и лист из первой найденной строки блока
-    For r = 2 To lastMapRow
-        If Trim(CStr(wsMapper.Cells(r, 2).Value)) = "APPX_113a" Then
+            mapFound = True
             excelSheetName = Trim(CStr(wsMapper.Cells(r, 5).Value))
+            keyColLetter = Trim(CStr(wsMapper.Cells(r, 6).Value))
             startRow = CLng(wsMapper.Cells(r, 7).Value)
             Exit For
         End If
     Next r
 
-    Set wsData = wbData.Worksheets(excelSheetName)
-
-    If wdTable.Rows.Count < SAMPLE_ROW + rowCount - 1 Then
-        MsgBox "В таблице APPX_113a не хватает строк под данные Mapper."
+    If Not mapFound Then
+        MsgBox "В Mapper нет строк для APPX_113a."
         Exit Sub
     End If
 
-    ' Каждая строка Mapper для APPX_113a — это один ПОКАЗАТЕЛЬ (строка Excel),
-    ' и одновременно один СТОЛБЕЦ Word-таблицы не подходит — реально данные
-    ' построчные: строка Excel startRow+i -> строка Word SAMPLE_ROW+i,
-    ' а столбцы Word 1..6 заполняются по буквам A..F из Mapper.
-    colOrder = 0
-    For r = 2 To lastMapRow
-        If Trim(CStr(wsMapper.Cells(r, 2).Value)) = "APPX_113a" Then
-            colOrder = colOrder + 1
-            colLetter = Trim(CStr(wsMapper.Cells(r, 6).Value))
+    Set wsData = wbData.Worksheets(excelSheetName)
+    keyColIdx = ColLetterToIndex(keyColLetter)
+    lastDataRow = wsData.Cells(wsData.Rows.Count, keyColIdx).End(xlUp).Row
 
-            Dim colIdx As Long
-            colIdx = ColLetterToIndex(colLetter)
+    If lastDataRow < startRow Then
+        MsgBox "В листе " & excelSheetName & " нет данных для APPX_113a."
+        Exit Sub
+    End If
 
-            For i = 0 To rowCount - 1
-                wordRow = SAMPLE_ROW + i
+    rowCount = lastDataRow - startRow + 1
+
+    Set wdTable = wdDoc.Tables(4)
+
+    ' Если в шаблоне строк меньше, чем нужно под данные, можно либо падать,
+    ' либо добавлять строки. Пока делаем проверку.
+    If wdTable.Rows.Count < SAMPLE_ROW + rowCount - 1 Then
+        MsgBox "В таблице APPX_113a не хватает строк под данные Excel."
+        Exit Sub
+    End If
+
+    ' Построчно заливаем Excel -> Word
+    For i = 0 To rowCount - 1
+        wordRow = SAMPLE_ROW + i
+
+        For r = 2 To lastMapRow
+            If Trim(CStr(wsMapper.Cells(r, 2).Value)) = "APPX_113a" Then
+
+                Dim colOrder As Long
+                Dim colLetter As String
+                Dim sheetName As String
                 Dim valueRow As Long
+                Dim colIdx As Long
+
+                colOrder = CLng(wsMapper.Cells(r, 3).Value)
+                sheetName = Trim(CStr(wsMapper.Cells(r, 5).Value))
+                colLetter = Trim(CStr(wsMapper.Cells(r, 6).Value))
                 valueRow = startRow + i
 
-                Call SafeSetCellText(wdTable, wordRow, colOrder, wsData.Cells(valueRow, colIdx).Text)
-            Next i
-        End If
-    Next r
+                If colLetter <> "" Then
+                    Set wsData = wbData.Worksheets(sheetName)
+                    colIdx = ColLetterToIndex(colLetter)
+
+                    Call SafeSetCellText(wdTable, wordRow, colOrder, wsData.Cells(valueRow, colIdx).Text)
+                End If
+            End If
+        Next r
+    Next i
 
 End Sub
-
 
 ' ============================================================
 ' TABLE 5 — APPX_113b: ценообразование по квартирам + 3 суммы.
