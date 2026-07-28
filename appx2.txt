@@ -392,21 +392,20 @@ Sub FillTable_APPX_112(wbMain As Workbook, wbData As Workbook, wdDoc As Object, 
 
     Dim i As Long
     Dim wordRow As Long
-    Dim firstInsertedRow As Long
 
     Dim cat As Variant
     Dim ph As String
+    Dim rowText As String
     Dim catCode As String
-    Dim cellText As String
 
-    Const SAMPLE_ROW As Long = 3     ' строка-образец в Word-таблице
-    Const FOOTER_CAT_COL As Long = 7 ' колонка, где лежит {{КАТЕГОРИЯ}} в подвале
+    Const HEADER_ROW As Long = 1
+    Const SAMPLE_ROW As Long = 2   ' контент начинается со строки 2
 
     Set wsMapper = wbMain.Worksheets("Mapper")
     lastMapRow = wsMapper.Cells(wsMapper.Rows.Count, 2).End(xlUp).Row
     mapFound = False
 
-    ' Ищем параметры блока APPX_112: WordTable теперь в колонке 2 (после Kind)
+    ' Берём базовые параметры блока APPX_112 из первой строки блока
     For r = 2 To lastMapRow
         If Trim(CStr(wsMapper.Cells(r, 2).Value)) = "APPX_112" Then
             mapFound = True
@@ -435,10 +434,21 @@ Sub FillTable_APPX_112(wbMain As Workbook, wbData As Workbook, wdDoc As Object, 
 
     Set wdTable = wdDoc.Tables(3)
 
-    ' ---- Шаг 1: удаляем строки подвала для неактивных категорий ----
+    ' =======================================================
+    ' ШАГ 1. Чистим footer:
+    ' удаляем только те строки, где есть плейсхолдер категории,
+    ' но этой категории нет в activeCats
+    ' =======================================================
     For r = wdTable.Rows.Count To 1 Step -1
-        cellText = SafeGetCellText(wdTable, r, FOOTER_CAT_COL)
-        catCode = ExtractCategoryCode(cellText)
+
+        On Error Resume Next
+        rowText = wdTable.Rows(r).Range.Text
+        On Error GoTo 0
+
+        rowText = Replace(rowText, Chr(13), "")
+        rowText = Replace(rowText, Chr(7), "")
+
+        catCode = ExtractCategoryCode(rowText)
 
         If catCode <> "" Then
             If Not activeCats.Exists(catCode) Then
@@ -447,12 +457,22 @@ Sub FillTable_APPX_112(wbMain As Workbook, wbData As Workbook, wdDoc As Object, 
         End If
     Next r
 
-    ' ---- Шаг 2: добавляем (rowCount - 1) пустых строк после строки-образца ----
+    ' =======================================================
+    ' ШАГ 2. Добавляем строки под контент:
+    ' одна строка уже есть в шаблоне (строка 2),
+    ' если данных больше — вставляем новые строки ПЕРЕД тем,
+    ' что сейчас находится ниже строки 2
+    ' =======================================================
     If rowCount > 1 Then
-        firstInsertedRow = InsertEmptyRowsAfter(wdTable, SAMPLE_ROW, rowCount - 1)
+        For i = 1 To rowCount - 1
+            wdTable.Rows.Add BeforeRow:=wdTable.Rows(SAMPLE_ROW + i)
+        Next i
     End If
 
-    ' ---- Шаг 3: заполняем построчно, начиная со строки-образца ----
+    ' =======================================================
+    ' ШАГ 3. Заполняем контентную часть построчно,
+    ' начиная со строки 2
+    ' =======================================================
     For i = 0 To rowCount - 1
         wordRow = SAMPLE_ROW + i
 
@@ -469,23 +489,26 @@ Sub FillTable_APPX_112(wbMain As Workbook, wbData As Workbook, wdDoc As Object, 
                 sheetName = Trim(CStr(wsMapper.Cells(r, 5).Value))
                 colLetter = Trim(CStr(wsMapper.Cells(r, 6).Value))
 
-                Set wsData = wbData.Worksheets(sheetName)
-                colIdx = ColLetterToIndex(colLetter)
-                valueRow = startRow + i
+                If colLetter <> "" Then
+                    Set wsData = wbData.Worksheets(sheetName)
+                    colIdx = ColLetterToIndex(colLetter)
+                    valueRow = startRow + i
 
-                Call SafeSetCellText(wdTable, wordRow, colOrder, wsData.Cells(valueRow, colIdx).Text)
+                    Call SafeSetCellText(wdTable, wordRow, colOrder, wsData.Cells(valueRow, colIdx).Text)
+                End If
             End If
         Next r
     Next i
 
-    ' ---- Шаг 4: заполняем оставшиеся (активные) итоговые строки подвала ----
+    ' =======================================================
+    ' ШАГ 4. Подставляем суммы в оставшиеся footer-строки
+    ' =======================================================
     For Each cat In activeCats.Keys
         ph = "{{" & CStr(cat) & "}}"
         Call ReplacePlaceholderInWord(wdDoc, ph, Format(activeCats(cat), "#,##0"))
     Next cat
 
 End Sub
-
 
 ' ============================================================
 ' TABLE 4 — APPX_113a: матрица корректировки (коэффициенты).
