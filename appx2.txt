@@ -612,15 +612,10 @@ End Sub
 
 ' ============================================================
 ' TABLE 5 — APPX_113b: ценообразование по квартирам + 3 суммы.
-' Реальная структура:
-'   Rows 1-2 — двухуровневая шапка с вертикальным merge (restart/continue),
-'              НЕ трогаем эти строки вообще
-'   Row 3    — строка-образец для клонирования данных
-'   Rows 4-6 — подвал, каждая строка это 3 ячейки:
-'              tc1 (gridSpan 1, пустая), tc2 (gridSpan 7, метка),
-'              tc3 (gridSpan 22, куда пишем сумму)
-'              То есть значение пишем в столбец 3 каждой footer-строки,
-'              а НЕ в 22/26/29 как было в старом коде.
+' Таблица содержит вертикальный merge в шапке (Rows 1-2),
+' поэтому Rows(n) / Rows.Add BeforeRow:=Rows(n) недоступны —
+' Word выбрасывает error 5991. Вставка строк идёт через
+' Selection.InsertRowsBelow, без обращения к коллекции Rows.
 ' ============================================================
 Sub FillTable_APPX_113b(wbMain As Workbook, wbData As Workbook, wdDoc As Object)
 
@@ -651,7 +646,7 @@ Sub FillTable_APPX_113b(wbMain As Workbook, wbData As Workbook, wdDoc As Object)
     Dim sumAI As Double
 
     Const SAMPLE_ROW As Long = 3
-    Const FOOTER_VALUE_COL As Long = 3   ' 3-я физическая ячейка в footer-строке
+    Const FOOTER_VALUE_COL As Long = 3
 
     Set wsMapper = wbMain.Worksheets("Mapper")
     lastMapRow = wsMapper.Cells(wsMapper.Rows.Count, 2).End(xlUp).Row
@@ -682,13 +677,18 @@ Sub FillTable_APPX_113b(wbMain As Workbook, wbData As Workbook, wdDoc As Object)
 
     Set wdTable = wdDoc.Tables(5)
 
-    ' Добавляем строки данных ПОСЛЕ строки-образца, без Range.Copy —
-    ' в Rows 1-2 есть вертикальный merge, и он не затрагивается,
-    ' т.к. вставка происходит ниже Row 3
+    ' ---- Вставляем (rowCount - 1) новых строк ПОСЛЕ строки-образца ----
+    ' Каждый раз выделяем ПЕРВУЮ ячейку строки-образца и вставляем строку
+    ' ниже неё через Selection.InsertRowsBelow — это работает даже
+    ' при наличии вертикального merge выше (в шапке).
     If rowCount > 1 Then
-        Call InsertEmptyRowsAfter(wdTable, SAMPLE_ROW, rowCount - 1)
+        For i = 1 To rowCount - 1
+            wdTable.Cell(SAMPLE_ROW, 1).Range.Select
+            wdDoc.Application.Selection.InsertRowsBelow 1
+        Next i
     End If
 
+    ' ---- Заполняем построчно, начиная со строки-образца ----
     For i = 0 To rowCount - 1
         wordRow = SAMPLE_ROW + i
 
@@ -716,7 +716,7 @@ Sub FillTable_APPX_113b(wbMain As Workbook, wbData As Workbook, wdDoc As Object)
         Next r
     Next i
 
-    ' ---- Подвал: 3 строки сразу после данных, значение — в 3-й физ. ячейке ----
+    ' ---- Подвал: 3 строки сразу после данных ----
     footerRow1 = SAMPLE_ROW + rowCount
     footerRow2 = footerRow1 + 1
     footerRow3 = footerRow2 + 1
@@ -730,7 +730,6 @@ Sub FillTable_APPX_113b(wbMain As Workbook, wbData As Workbook, wdDoc As Object)
     Call SafeSetCellText(wdTable, footerRow3, FOOTER_VALUE_COL, Format(sumAI, "#,##0"))
 
 End Sub
-
 
 ' ============================================================
 ' TABLE 6 — APPX_114: варианты первоначального взноса.
