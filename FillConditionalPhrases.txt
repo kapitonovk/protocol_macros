@@ -1,0 +1,258 @@
+' ============================================================
+' УСЛОВНЫЕ ПЛЕЙСХОЛДЕРЫ ДЛЯ ПРИЛОЖЕНИЯ
+' {{ОБЪЕКТ_ШАБЛОННАЯ_ФРАЗА}}
+' {{СОГЛАСОВАНИЕ_ИСТОЧНИКИ}}
+' ============================================================
+
+Sub FillConditionalPhrases_APPX(wbMain As Workbook, wdDoc As Object)
+
+    Dim sourceRow As Long
+    Dim dealType As String
+    Dim developerType As String
+    Dim objectAddress As String
+
+    Dim objectCondition As String
+    Dim objectPhrase As String
+
+    Dim approvalTemplate As String
+    Dim approvalInnerPlaceholder As String
+    Dim approvalData As String
+    Dim approvalPhrase As String
+
+    sourceRow = FindSourceRowByNumber(wbMain, "1.0")
+    If sourceRow = 0 Then
+        MsgBox "Не найдена строка 1.0 в Sources."
+        Exit Sub
+    End If
+
+    dealType = Trim(CStr(GetSourceValueByHeader(wbMain, sourceRow, "Тип")))
+    developerType = Trim(CStr(GetSourceValueByHeader(wbMain, sourceRow, "Застройщик (фонд / не фонд)")))
+    objectAddress = Trim(GetDataScalarByPlaceholder(wbMain, Workbooks.Open(GetSourcePathByNumber(wbMain, "1.0")), "{{АДРЕС}}"))
+
+    ' ---- 1. {{ОБЪЕКТ_ШАБЛОННАЯ_ФРАЗА}} ----
+    If UCase(dealType) = "ДКП" And LCase(developerType) = "фонд" Then
+        objectCondition = "ДКП_фонд"
+    Else
+        objectCondition = "Иное"
+    End If
+
+    objectPhrase = GetPhraseValue(wbMain, "{{ОБЪЕКТ_ШАБЛОННАЯ_ФРАЗА}}", objectCondition)
+    Call ReplacePlaceholderInWord(wdDoc, "{{ОБЪЕКТ_ШАБЛОННАЯ_ФРАЗА}}", objectPhrase)
+
+    ' ---- 2. {{СОГЛАСОВАНИЕ_ИСТОЧНИКИ}} ----
+    approvalTemplate = GetPhraseValue(wbMain, "{{СОГЛАСОВАНИЕ_ИСТОЧНИКИ}}", dealType)
+
+    If UCase(dealType) = "ДДУ" Then
+        approvalInnerPlaceholder = "{{ДАННЫЕ_ПРОТОКОЛА}}"
+    ElseIf UCase(dealType) = "ДКП" Then
+        approvalInnerPlaceholder = "{{ДАННЫЕ_ПИСЬМА}}"
+    Else
+        approvalInnerPlaceholder = ""
+    End If
+
+    If approvalInnerPlaceholder <> "" Then
+        approvalData = GetDocRefValue(wbMain, approvalInnerPlaceholder, dealType, objectAddress)
+        approvalPhrase = Replace(approvalTemplate, approvalInnerPlaceholder, approvalData)
+    Else
+        approvalPhrase = approvalTemplate
+    End If
+
+    Call ReplacePlaceholderInWord(wdDoc, "{{СОГЛАСОВАНИЕ_ИСТОЧНИКИ}}", approvalPhrase)
+
+End Sub
+
+
+Function GetSourceValueByHeader(wbMain As Workbook, sourceRow As Long, headerText As String) As String
+
+    Dim ws As Worksheet
+    Dim colIdx As Long
+
+    Set ws = wbMain.Worksheets("Sources")
+    colIdx = FindHeaderColumn(ws, headerText)
+
+    If colIdx = 0 Then
+        GetSourceValueByHeader = ""
+    Else
+        GetSourceValueByHeader = Trim(CStr(ws.Cells(sourceRow, colIdx).Value))
+    End If
+
+End Function
+
+
+Function GetSourcePathByNumber(wbMain As Workbook, sourceNumber As String) As String
+
+    Dim ws As Worksheet
+    Dim sourceRow As Long
+    Dim colPath As Long
+
+    Set ws = wbMain.Worksheets("Sources")
+    sourceRow = FindSourceRowByNumber(wbMain, sourceNumber)
+    colPath = FindHeaderColumn(ws, "Путь")
+
+    If sourceRow = 0 Or colPath = 0 Then
+        GetSourcePathByNumber = ""
+    Else
+        GetSourcePathByNumber = Trim(CStr(ws.Cells(sourceRow, colPath).Value))
+    End If
+
+End Function
+
+
+Function GetPhraseValue(wbMain As Workbook, placeholderText As String, conditionText As String) As String
+
+    Dim ws As Worksheet
+    Dim lastRow As Long
+    Dim r As Long
+
+    Set ws = wbMain.Worksheets("Phrases")
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+
+    For r = 2 To lastRow
+        If Trim(CStr(ws.Cells(r, 1).Value)) = Trim(placeholderText) _
+           And Trim(CStr(ws.Cells(r, 2).Value)) = Trim(conditionText) Then
+
+            GetPhraseValue = CStr(ws.Cells(r, 3).Value)
+            Exit Function
+        End If
+    Next r
+
+    GetPhraseValue = ""
+
+End Function
+
+
+Function NormalizeAddress(ByVal s As String) As String
+
+    s = Trim(s)
+    s = Replace(s, Chr(160), " ")
+    s = Replace(s, "ё", "е")
+    s = Replace(s, "Ё", "Е")
+    s = Replace(s, "—", "-")
+    s = Replace(s, "–", "-")
+
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+
+    NormalizeAddress = UCase(s)
+
+End Function
+
+
+Function GetDocRefValue(wbMain As Workbook, placeholderText As String, conditionText As String, objectAddress As String) As String
+
+    Dim wsDocRefs As Worksheet
+    Dim lastRow As Long
+    Dim r As Long
+
+    Dim srcSheet As String
+    Dim addrColLetter As String
+    Dim noColLetter As String
+    Dim dateColLetter As String
+    Dim fullTextColLetter As String
+
+    Dim filePath As String
+    Dim wbExt As Workbook
+    Dim wsExt As Worksheet
+
+    Dim addrColIdx As Long
+    Dim noColIdx As Long
+    Dim dateColIdx As Long
+    Dim fullTextColIdx As Long
+
+    Dim lastDataRow As Long
+    Dim i As Long
+
+    Dim currentAddr As String
+    Dim normTarget As String
+    Dim dateVal As Variant
+    Dim noVal As String
+    Dim fullTextVal As String
+
+    Set wsDocRefs = wbMain.Worksheets("DocRefs")
+    lastRow = wsDocRefs.Cells(wsDocRefs.Rows.Count, 1).End(xlUp).Row
+    normTarget = NormalizeAddress(objectAddress)
+
+    For r = 2 To lastRow
+        If Trim(CStr(wsDocRefs.Cells(r, 1).Value)) = Trim(placeholderText) _
+           And Trim(CStr(wsDocRefs.Cells(r, 2).Value)) = Trim(conditionText) Then
+
+            srcSheet = Trim(CStr(wsDocRefs.Cells(r, 3).Value))
+            addrColLetter = Trim(CStr(wsDocRefs.Cells(r, 4).Value))
+            noColLetter = Trim(CStr(wsDocRefs.Cells(r, 5).Value))
+            dateColLetter = Trim(CStr(wsDocRefs.Cells(r, 6).Value))
+
+            Exit For
+        End If
+    Next r
+
+    If srcSheet = "" Then
+        GetDocRefValue = ""
+        Exit Function
+    End If
+
+    If UCase(conditionText) = "ДДУ" Then
+        filePath = GetSourcePathByNumber(wbMain, "0.4")
+    ElseIf UCase(conditionText) = "ДКП" Then
+        filePath = GetSourcePathByNumber(wbMain, "0.3")
+    Else
+        GetDocRefValue = ""
+        Exit Function
+    End If
+
+    If filePath = "" Then
+        GetDocRefValue = ""
+        Exit Function
+    End If
+
+    Set wbExt = Workbooks.Open(Filename:=filePath, ReadOnly:=True, UpdateLinks:=False)
+    Set wsExt = wbExt.Worksheets(srcSheet)
+
+    addrColIdx = ColLetterToIndex(addrColLetter)
+    noColIdx = ColLetterToIndex(noColLetter)
+    dateColIdx = ColLetterToIndex(dateColLetter)
+
+    lastDataRow = wsExt.Cells(wsExt.Rows.Count, addrColIdx).End(xlUp).Row
+
+    For i = 2 To lastDataRow
+        currentAddr = NormalizeAddress(CStr(wsExt.Cells(i, addrColIdx).Value))
+
+        If currentAddr = normTarget Then
+
+            If UCase(conditionText) = "ДДУ" Then
+                ' Для DDU лучше брать уже готовый reference из Name.
+                ' Пока как fallback: предполагаем, что Name = колонка G.
+                fullTextVal = Trim(CStr(wsExt.Cells(i, 7).Value))
+                If fullTextVal <> "" Then
+                    GetDocRefValue = fullTextVal
+                Else
+                    dateVal = wsExt.Cells(i, dateColIdx).Value
+                    noVal = Trim(CStr(wsExt.Cells(i, noColIdx).Value))
+
+                    If IsDate(dateVal) Then
+                        GetDocRefValue = Format(CDate(dateVal), "dd.mm.yyyy") & " № " & noVal
+                    Else
+                        GetDocRefValue = CStr(dateVal) & " № " & noVal
+                    End If
+                End If
+
+            ElseIf UCase(conditionText) = "ДКП" Then
+                dateVal = wsExt.Cells(i, dateColIdx).Value
+                noVal = Trim(CStr(wsExt.Cells(i, noColIdx).Value))
+
+                If IsDate(dateVal) Then
+                    GetDocRefValue = Format(CDate(dateVal), "dd.mm.yyyy") & " № " & noVal
+                Else
+                    GetDocRefValue = CStr(dateVal) & " № " & noVal
+                End If
+            End If
+
+            wbExt.Close SaveChanges:=False
+            Exit Function
+        End If
+    Next i
+
+    wbExt.Close SaveChanges:=False
+    GetDocRefValue = ""
+
+End Function
