@@ -1,0 +1,581 @@
+Attribute VB_Name = "make_report"
+Option Explicit
+
+' ============================================================
+' ОРКЕСТРАТОР СБОРКИ ПРОТОКОЛА
+'
+' Структура результата:
+'   0. титульник            (Sources 0.1)
+'   1. body x N             (Sources 0.2)  — по одному на каждый data-источник
+'   2. лист согласования    (Sources 0.3)
+'   3. appendix x N         (Sources 0.4)  — по одному на каждый data-источник
+'
+' Модуль make_appx НЕ изменяется: его публичные функции вызываются как есть.
+' Модуль make_body изменён только в части параметризации (см. make_body).
+' ============================================================
+
+' --- Поведенческие флаги -------------------------------------------------
+' Заменять ли в тексте шаблонов жёстко прописанные номера разделов
+' ("п. 1.1.1", "Приложению 1.1.2", "Приложении № 1.1.3") на номер
+' текущего источника. Нужно, пока в шаблонах не проставлен {{I}}.
+Private Const FIX_HARDCODED_SECTION_NUMBERS As Boolean = True
+
+' Удалять ли блок "Приложение № 1.x.4 (рассрочка по ДДУ)" из копии
+' приложения, если Тип источника не ДДУ. make_appx при этом не меняется:
+' блок вырезается пост-обработкой уже заполненного документа.
+Private Const DROP_DDU_BLOCK_FOR_NON_DDU As Boolean = True
+
+' Открывать результат в Word после сборки
+Private Const SHOW_RESULT As Boolean = True
+
+' --- Константы Word (позднее связывание) --------------------------------
+Private Const wdCollapseStart As Long = 1
+Private Const wdCollapseEnd As Long = 0
+Private Const wdSectionBreakNextPage As Long = 2
+Private Const wdFormatDocumentDefault As Long = 16
+
+
+' ============================================================
+' ЕДИНСТВЕННАЯ ТОЧКА ВХОДА
+' ============================================================
+Public Sub BuildProtocol()
+
+    Dim wbMain As Workbook
+    Dim wsSources As Worksheet
+
+    Dim srcNums() As String
+    Dim srcRows() As Long
+    Dim srcPaths() As String
+    Dim srcCount As Long
+
+    Dim titlePath As String
+    Dim bodyPath As String
+    Dim approvalPath As String
+    Dim appendixPath As String
+
+    Dim wdApp As Object
+    Dim wdMaster As Object
+    Dim wdPart As Object
+    Dim wbData As Workbook
+
+    Dim tmpDir As String
+    Dim bodyFiles() As String
+    Dim appxFiles() As String
+
+    Dim i As Long
+    Dim outPath As String
+    Dim prevScreen As Boolean
+    Dim prevAlerts As Boolean
+
+    Set wbMain = ThisWorkbook
+    Set wsSources = wbMain.Worksheets("Sources")
+
+    ' ---- 1. Пути к служебным шаблонам ----
+    titlePath = GetSourcePathByNumber(wbMain, "0.1")
+    bodyPath = GetSourcePathByNumber(wbMain, "0.2")
+    approvalPath = GetSourcePathByNumber(wbMain, "0.3")
+    appendixPath = GetSourcePathByNumber(wbMain, "0.4")
+
+    If Not FileExists(titlePath) Then
+        MsgBox "Не найден шаблон титульника (Sources 0.1): " & titlePath, vbExclamation
+        Exit Sub
+    End If
+    If Not FileExists(bodyPath) Then
+        MsgBox "Не найден шаблон body (Sources 0.2): " & bodyPath, vbExclamation
+        Exit Sub
+    End If
+    If Not FileExists(approvalPath) Then
+        MsgBox "Не найден шаблон листа согласования (Sources 0.3): " & approvalPath, vbExclamation
+        Exit Sub
+    End If
+    If Not FileExists(appendixPath) Then
+        MsgBox "Не найден шаблон приложения (Sources 0.4): " & appendixPath, vbExclamation
+        Exit Sub
+    End If
+
+    ' ---- 2. Собираем список data-источников ----
+    srcCount = CollectDataSources(wbMain, srcNums, srcRows, srcPaths)
+
+    If srcCount = 0 Then
+        MsgBox "В Sources не найдено ни одного существующего data-файла " & _
+               "(строки с номерами 1, 2, 3 ...).", vbExclamation
+        Exit Sub
+    End If
+
+    ReDim bodyFiles(1 To srcCount)
+    ReDim appxFiles(1 To srcCount)
+
+    tmpDir = MakeTempDir()
+    If tmpDir = "" Then
+        MsgBox "Не удалось создать временную папку для сборки.", vbExclamation
+        Exit Sub
+    End If
+
+    prevScreen = Application.ScreenUpdating
+    prevAlerts = Application.DisplayAlerts
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+
+    On Error GoTo Fail
+
+    ' ---- 3. Word и master-документ (титульник) ----
+    Set wdApp = CreateObject("Word.Application")
+    wdApp.Visible = False
+    wdApp.DisplayAlerts = 0
+
+    Set wdMaster = wdApp.Documents.Add(Template:=titlePath)
+    Call ApplyConfigScalars(wbMain, wdMaster)
+
+    ' ---- 4. По каждому источнику: body + appendix во временные файлы ----
+    For i = 1 To srcCount
+
+        Set wbData = Workbooks.Open(Filename:=srcPaths(i), ReadOnly:=True, UpdateLinks:=False)
+
+        ' ---- body ----
+        Set wdPart = wdApp.Documents.Add(Template:=bodyPath)
+        Call BuildBodyDoc(wbMain, wbData, wdPart, srcNums(i), srcRows(i))
+        Call ApplyConfigScalars(wbMain, wdPart)
+        Call FinalizeSectionNumbers(wdPart, srcNums(i))
+        Call TrimTrailingEmptyParagraphs(wdPart)
+
+        bodyFiles(i) = tmpDir & "part_body_" & Format(i, "00") & ".docx"
+        wdPart.SaveAs2 Filename:=bodyFiles(i), FileFormat:=wdFormatDocumentDefault
+        wdPart.Close SaveChanges:=False
+        Set wdPart = Nothing
+
+        ' ---- appendix ----
+        Set wdPart = wdApp.Documents.Add(Template:=appendixPath)
+        Call BuildSection_1_1_APPX(wbMain, wbData, wdPart, srcRows(i))
+
+        ' пост-обработка того, что make_appx не закрывает
+        If DROP_DDU_BLOCK_FOR_NON_DDU Then
+            If UCase(Trim(GetSourceValueByHeader(wbMain, srcRows(i), "Тип"))) <> "ДДУ" Then
+                Call DropDduInstalmentBlock(wdPart)
+            End If
+        End If
+
+        Call ReplacePlaceholderInWord(wdPart, "{{КВАРТИРЫ_СЧЕТ}}", _
+                                      CStr(CountVectorRows(wbMain, wbData, "APPX_112")))
+        Call ApplyConfigScalars(wbMain, wdPart)
+        Call FinalizeSectionNumbers(wdPart, srcNums(i))
+        Call TrimTrailingEmptyParagraphs(wdPart)
+
+        appxFiles(i) = tmpDir & "part_appx_" & Format(i, "00") & ".docx"
+        wdPart.SaveAs2 Filename:=appxFiles(i), FileFormat:=wdFormatDocumentDefault
+        wdPart.Close SaveChanges:=False
+        Set wdPart = Nothing
+
+        wbData.Close SaveChanges:=False
+        Set wbData = Nothing
+    Next i
+
+    ' ---- 5. Лист согласования во временный файл ----
+    Set wdPart = wdApp.Documents.Add(Template:=approvalPath)
+    Call ApplyConfigScalars(wbMain, wdPart)
+    Call TrimTrailingEmptyParagraphs(wdPart)
+
+    Dim approvalFile As String
+    approvalFile = tmpDir & "part_approval.docx"
+    wdPart.SaveAs2 Filename:=approvalFile, FileFormat:=wdFormatDocumentDefault
+    wdPart.Close SaveChanges:=False
+    Set wdPart = Nothing
+
+    ' ---- 6. Мердж: титул -> body x N -> согласование -> appendix x N ----
+    For i = 1 To srcCount
+        Call AppendFileToMaster(wdMaster, bodyFiles(i))
+    Next i
+
+    Call AppendFileToMaster(wdMaster, approvalFile)
+
+    For i = 1 To srcCount
+        Call AppendFileToMaster(wdMaster, appxFiles(i))
+    Next i
+
+    ' ---- 7. Финальные скаляры на всякий случай + сохранение ----
+    Call ApplyConfigScalars(wbMain, wdMaster)
+
+    outPath = BuildOutputPath(wbMain)
+    wdMaster.SaveAs2 Filename:=outPath, FileFormat:=wdFormatDocumentDefault
+
+    If SHOW_RESULT Then
+        wdApp.Visible = True
+        wdApp.Activate
+    Else
+        wdMaster.Close SaveChanges:=False
+        wdApp.Quit
+    End If
+
+    Call CleanupTempDir(tmpDir)
+
+    Application.ScreenUpdating = prevScreen
+    Application.DisplayAlerts = prevAlerts
+
+    MsgBox "Готово. Источников обработано: " & srcCount & vbCrLf & _
+           "Файл: " & outPath, vbInformation
+    Exit Sub
+
+Fail:
+    Dim errText As String
+    errText = "Ошибка сборки: " & Err.Number & " — " & Err.Description
+
+    On Error Resume Next
+    If Not wbData Is Nothing Then wbData.Close SaveChanges:=False
+    If Not wdPart Is Nothing Then wdPart.Close SaveChanges:=False
+    If Not wdApp Is Nothing Then
+        wdApp.Visible = True
+        wdApp.DisplayAlerts = -1
+    End If
+    Application.ScreenUpdating = prevScreen
+    Application.DisplayAlerts = prevAlerts
+    On Error GoTo 0
+
+    MsgBox errText, vbCritical
+
+End Sub
+
+
+' ============================================================
+' СБОР DATA-ИСТОЧНИКОВ ИЗ SOURCES
+' Берём строки, где Номер не содержит точку (то есть не 0.x),
+' файл указан и физически существует.
+' ============================================================
+Private Function CollectDataSources(wbMain As Workbook, _
+                                    ByRef srcNums() As String, _
+                                    ByRef srcRows() As Long, _
+                                    ByRef srcPaths() As String) As Long
+
+    Dim ws As Worksheet
+    Dim numCol As Long, fileCol As Long, pathCol As Long
+    Dim lastRow As Long
+    Dim r As Long
+    Dim n As Long
+
+    Dim numTxt As String
+    Dim fileTxt As String
+    Dim pathTxt As String
+
+    Set ws = wbMain.Worksheets("Sources")
+
+    numCol = FindHeaderColumn(ws, "Номер")
+    fileCol = FindHeaderColumn(ws, "Файл")
+    pathCol = FindHeaderColumn(ws, "Путь")
+
+    If numCol = 0 Or pathCol = 0 Then
+        CollectDataSources = 0
+        Exit Function
+    End If
+
+    lastRow = ws.Cells(ws.Rows.Count, numCol).End(xlUp).Row
+
+    ReDim srcNums(1 To Application.Max(1, lastRow))
+    ReDim srcRows(1 To Application.Max(1, lastRow))
+    ReDim srcPaths(1 To Application.Max(1, lastRow))
+
+    n = 0
+
+    For r = 2 To lastRow
+
+        numTxt = Trim(CStr(ws.Cells(r, numCol).Value))
+
+        ' служебные строки 0.1 ... 0.6 пропускаем
+        If numTxt <> "" And InStr(numTxt, ".") = 0 And InStr(numTxt, ",") = 0 Then
+
+            If fileCol > 0 Then
+                fileTxt = Trim(CStr(ws.Cells(r, fileCol).Value))
+            Else
+                fileTxt = "x"
+            End If
+
+            pathTxt = Trim(CStr(ws.Cells(r, pathCol).Value))
+            pathTxt = Replace(pathTxt, Chr(160), " ")
+            pathTxt = Trim(pathTxt)
+
+            If fileTxt <> "" And pathTxt <> "" Then
+                If FileExists(pathTxt) Then
+                    n = n + 1
+                    srcNums(n) = numTxt
+                    srcRows(n) = r
+                    srcPaths(n) = pathTxt
+                End If
+            End If
+        End If
+    Next r
+
+    If n > 0 Then
+        ReDim Preserve srcNums(1 To n)
+        ReDim Preserve srcRows(1 To n)
+        ReDim Preserve srcPaths(1 To n)
+    End If
+
+    CollectDataSources = n
+
+End Function
+
+
+' ============================================================
+' СКАЛЯРЫ ИЗ CONFIG (нужны титульнику, листу согласования и body)
+' ============================================================
+Public Sub ApplyConfigScalars(wbMain As Workbook, wdDoc As Object)
+
+    Dim protNum As String
+    Dim date1 As String
+    Dim date1Formatted As String
+    Dim date2 As String
+
+    protNum = GetConfigValue(wbMain, "{{ПРОТ_НОМЕР}}")
+    date1 = GetConfigValue(wbMain, "{{ДАТА1}}")
+    date1Formatted = FormatDateForProtocol(date1)
+
+    If IsDate(date1) Then
+        date2 = Format(DateAdd("d", 90, CDate(date1)), "dd.mm.yyyy")
+    Else
+        date2 = date1
+    End If
+
+    Call ReplacePlaceholderInWord(wdDoc, "{{ПРОТ_НОМЕР}}", protNum)
+    Call ReplacePlaceholderInWord(wdDoc, "{{ДАТА1ФОРМАТ}}", date1Formatted)
+    Call ReplacePlaceholderInWord(wdDoc, "{{ДАТА1}}", date1)
+    Call ReplacePlaceholderInWord(wdDoc, "{{ДАТА2}}", date2)
+
+End Sub
+
+
+' ============================================================
+' НОМЕРА РАЗДЕЛОВ: {{I}} и жёстко прописанные 1.1.x
+' ============================================================
+Public Sub FinalizeSectionNumbers(wdDoc As Object, ByVal sourceNumber As String)
+
+    Dim k As Long
+    Dim sn As String
+
+    sn = Trim(sourceNumber)
+
+    ' опечатка в шаблоне приложения: "1.{{I}.3" (не хватает скобки)
+    Call ReplacePlaceholderInWord(wdDoc, "1.{{I}.", "1." & sn & ".")
+    Call ReplacePlaceholderInWord(wdDoc, "{{I}}", sn)
+
+    If FIX_HARDCODED_SECTION_NUMBERS And sn <> "1" Then
+        For k = 1 To 4
+            Call ReplacePlaceholderInWord(wdDoc, "1.1." & CStr(k), sn_Sect(sn, k))
+        Next k
+    End If
+
+End Sub
+
+Private Function sn_Sect(ByVal sn As String, ByVal k As Long) As String
+    sn_Sect = "1." & sn & "." & CStr(k)
+End Function
+
+
+' ============================================================
+' УДАЛЕНИЕ БЛОКА "Приложение № 1.x.4" (рассрочка по ДДУ)
+' Блок последний в документе, поэтому режем от его первого абзаца
+' до конца документа вместе с предшествующим разрывом раздела.
+' ============================================================
+Private Sub DropDduInstalmentBlock(wdDoc As Object)
+
+    Dim p As Long
+    Dim t As String
+    Dim startPos As Long
+    Dim rngDel As Object
+
+    For p = 1 To wdDoc.Paragraphs.Count
+        t = wdDoc.Paragraphs(p).Range.Text
+        t = Replace(t, Chr(13), "")
+        t = Replace(t, Chr(7), "")
+        t = Replace(t, Chr(160), " ")
+
+        If InStr(1, t, "Приложение", vbTextCompare) > 0 And InStr(t, ".4") > 0 Then
+
+            startPos = wdDoc.Paragraphs(p).Range.Start
+            If startPos > 0 Then startPos = startPos - 1   ' забираем разрыв раздела
+
+            On Error Resume Next
+            Set rngDel = wdDoc.Range(startPos, wdDoc.Content.End - 1)
+            rngDel.Delete
+            On Error GoTo 0
+
+            Exit Sub
+        End If
+    Next p
+
+End Sub
+
+
+' ============================================================
+' СКОЛЬКО СТРОК ДАННЫХ В VECTOR-БЛОКЕ MAPPER (для {{КВАРТИРЫ_СЧЕТ}})
+' ============================================================
+Public Function CountVectorRows(wbMain As Workbook, wbData As Workbook, ByVal blockName As String) As Long
+
+    Dim wsMapper As Worksheet
+    Dim wsData As Worksheet
+    Dim lastMapRow As Long
+    Dim r As Long
+
+    Dim sheetName As String
+    Dim keyColLetter As String
+    Dim startRow As Long
+    Dim keyColIdx As Long
+    Dim lastDataRow As Long
+
+    Set wsMapper = wbMain.Worksheets("Mapper")
+    lastMapRow = wsMapper.Cells(wsMapper.Rows.Count, 2).End(xlUp).Row
+
+    For r = 2 To lastMapRow
+        If Trim(CStr(wsMapper.Cells(r, 2).Value)) = blockName Then
+            sheetName = Trim(CStr(wsMapper.Cells(r, 5).Value))
+            keyColLetter = Trim(CStr(wsMapper.Cells(r, 6).Value))
+            If Trim(CStr(wsMapper.Cells(r, 7).Value)) <> "" Then
+                startRow = CLng(wsMapper.Cells(r, 7).Value)
+            End If
+            Exit For
+        End If
+    Next r
+
+    If sheetName = "" Or keyColLetter = "" Or startRow = 0 Then
+        CountVectorRows = 0
+        Exit Function
+    End If
+
+    On Error GoTo Fail
+    Set wsData = wbData.Worksheets(sheetName)
+    keyColIdx = ColLetterToIndex(keyColLetter)
+    lastDataRow = wsData.Cells(wsData.Rows.Count, keyColIdx).End(xlUp).Row
+
+    If lastDataRow >= startRow Then
+        CountVectorRows = lastDataRow - startRow + 1
+    Else
+        CountVectorRows = 0
+    End If
+    Exit Function
+
+Fail:
+    CountVectorRows = 0
+
+End Function
+
+
+' ============================================================
+' МЕРДЖ ЧАСТИ В MASTER
+' Разрыв раздела "со следующей страницы" сохраняет ориентацию
+' и параметры страниц вставляемого документа.
+' ============================================================
+Private Sub AppendFileToMaster(wdMaster As Object, ByVal filePath As String)
+
+    Dim rng As Object
+
+    Set rng = wdMaster.Content
+    rng.Collapse wdCollapseEnd
+    rng.InsertBreak wdSectionBreakNextPage
+
+    Set rng = wdMaster.Content
+    rng.Collapse wdCollapseEnd
+    rng.InsertFile Filename:=filePath, ConfirmConversions:=False, Link:=False, Attachment:=False
+
+End Sub
+
+
+' ============================================================
+' Чистит хвостовые пустые абзацы части, чтобы при мердже
+' не копились пустые страницы. Абзацы внутри таблиц не трогаем.
+' ============================================================
+Private Sub TrimTrailingEmptyParagraphs(wdDoc As Object)
+
+    Dim guard As Long
+    Dim t As String
+
+    On Error Resume Next
+
+    For guard = 1 To 20
+        If wdDoc.Paragraphs.Count <= 1 Then Exit Sub
+
+        If wdDoc.Paragraphs(wdDoc.Paragraphs.Count).Range.Tables.Count > 0 Then Exit Sub
+
+        t = wdDoc.Paragraphs(wdDoc.Paragraphs.Count).Range.Text
+        t = Replace(t, Chr(13), "")
+        t = Replace(t, Chr(7), "")
+        t = Replace(t, Chr(160), " ")
+
+        If Trim(t) <> "" Then Exit Sub
+
+        wdDoc.Paragraphs(wdDoc.Paragraphs.Count).Range.Delete
+    Next guard
+
+End Sub
+
+
+' ============================================================
+' ФАЙЛОВЫЕ УТИЛИТЫ
+' ============================================================
+Private Function FileExists(ByVal p As String) As Boolean
+
+    Dim res As String
+
+    FileExists = False
+    p = Trim(Replace(p, Chr(160), " "))
+    If p = "" Then Exit Function
+    If Right$(p, 1) = "\" Then Exit Function
+
+    On Error Resume Next
+    res = Dir(p)
+    On Error GoTo 0
+
+    FileExists = (res <> "")
+
+End Function
+
+
+Private Function MakeTempDir() As String
+
+    Dim base As String
+    Dim p As String
+
+    base = Environ$("TEMP")
+    If base = "" Then base = ThisWorkbook.Path
+    If Right$(base, 1) <> "\" Then base = base & "\"
+
+    p = base & "protocol_build_" & Format(Now, "yyyymmdd_hhnnss") & "\"
+
+    On Error GoTo Fail
+    MkDir Left$(p, Len(p) - 1)
+    MakeTempDir = p
+    Exit Function
+
+Fail:
+    MakeTempDir = ""
+
+End Function
+
+
+Private Sub CleanupTempDir(ByVal tmpDir As String)
+
+    On Error Resume Next
+    If tmpDir = "" Then Exit Sub
+    Kill tmpDir & "*.docx"
+    RmDir Left$(tmpDir, Len(tmpDir) - 1)
+
+End Sub
+
+
+Private Function BuildOutputPath(wbMain As Workbook) As String
+
+    Dim protNum As String
+    Dim safeNum As String
+    Dim i As Long
+    Dim bad As Variant
+
+    protNum = GetConfigValue(wbMain, "{{ПРОТ_НОМЕР}}")
+    safeNum = protNum
+
+    bad = Array("\", "/", ":", "*", "?", """", "<", ">", "|")
+    For i = LBound(bad) To UBound(bad)
+        safeNum = Replace(safeNum, CStr(bad(i)), "-")
+    Next i
+
+    safeNum = Trim(safeNum)
+    If safeNum = "" Then safeNum = "no_num"
+
+    BuildOutputPath = wbMain.Path & "\protocol_" & safeNum & "_" & _
+                      Format(Now, "yyyymmdd_hhnn") & ".docx"
+
+End Function

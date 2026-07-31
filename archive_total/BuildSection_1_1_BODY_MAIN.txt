@@ -1,0 +1,63 @@
+Option Explicit
+
+Sub BuildSection_1_1_BODY_MAIN()
+
+    Dim wbMain As Workbook
+    Dim wsSources As Worksheet
+    Dim wsMapper As Worksheet
+
+    Dim wbData As Workbook
+    Dim wdApp As Object
+    Dim wdBody As Object
+
+    Dim bodyPath As String
+    Dim dataPath As String
+
+    Dim lastRow As Long
+    Dim i As Long
+    Dim numVal As Variant
+
+    Set wbMain = ThisWorkbook
+    Set wsSources = wbMain.Worksheets("Sources")
+    Set wsMapper = wbMain.Worksheets("Mapper")
+
+    ' Найти путь к шаблону BODY (Номер = 0.1)
+    lastRow = wsSources.Cells(wsSources.Rows.Count, 1).End(xlUp).Row
+    For i = 2 To lastRow
+        numVal = wsSources.Cells(i, 1).Value
+        If CStr(numVal) = "0.1" Then
+            bodyPath = wsSources.Cells(i, 4).Value   ' Путь
+            Exit For
+        End If
+    Next i
+
+    ' Найти путь к data-файлу для раздела 1 (Номер = 1)
+    For i = 2 To lastRow
+        numVal = wsSources.Cells(i, 1).Value
+        If CStr(numVal) = "1" Then
+            dataPath = wsSources.Cells(i, 4).Value   ' Путь к data1.xlsx
+            Exit For
+        End If
+    Next i
+
+    If bodyPath = "" Or dataPath = "" Then
+        MsgBox "Не найден путь к шаблону BODY или data-файлу в Sources."
+        Exit Sub
+    End If
+
+    ' Открываем data-файл
+    Set wbData = Workbooks.Open(dataPath)
+
+    ' Открываем Word и шаблон протокола
+    Set wdApp = CreateObject("Word.Application")
+    wdApp.Visible = True
+    Set wdBody = wdApp.Documents.Open(bodyPath)
+
+    ' Заливаем основную таблицу квартир BODY_MAIN
+    Call FillTable_BODY_MAIN(wbMain, wbData, wdBody)
+
+    ' По желанию: сохранить документ и закрыть data-файл
+    ' wdBody.SaveAs2 Filename:=...  ' придумать имя
+    ' wbData.Close SaveChanges:=False
+
+End Sub
