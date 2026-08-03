@@ -72,6 +72,17 @@ Private Const wdKeepSourceFormatting As Long = 0
 ' Именно поэтому отдельно собранный appendix при Visible = True выглядит нормально.
 Private Const BUILD_WITH_WORD_VISIBLE As Boolean = True
 
+' Посекционный мердж: для каждой секции источника в master создаётся своя
+' секция с теми же параметрами страницы, и туда вставляется только её
+' содержимое. Это точный аналог ручного «выделил кусок — Ctrl+C — Ctrl+V».
+Private Const MERGE_BY_SECTION As Boolean = True
+
+' Вставлять через Selection, а не через Range.
+' Range.PasteAndFormat в части случаев игнорирует «сохранить исходное
+' форматирование» и применяет стили приёмника. Selection.PasteAndFormat —
+' буквально тот же код, что выполняется при ручной вставке мышкой.
+Private Const PASTE_VIA_SELECTION As Boolean = True
+
 ' Переносить содержимое колонтитулов частей (если они непустые)
 Private Const COPY_HEADERS_FOOTERS As Boolean = True
 
@@ -341,20 +352,6 @@ End Sub
 ' ============================================================
 ' МЕРДЖ ОДНОЙ ЧАСТИ В MASTER С СОХРАНЕНИЕМ ОФОРМЛЕНИЯ
 ' ============================================================
-' Посекционный мердж: для каждой секции источника в master создаётся своя
-' секция с теми же параметрами страницы, и туда вставляется только её
-' содержимое. Это точный аналог ручного «выделил кусок — Ctrl+C — Ctrl+V».
-Private Const MERGE_BY_SECTION As Boolean = True
-
-' Вставлять через Selection, а не через Range.
-' Range.PasteAndFormat в части случаев игнорирует «сохранить исходное
-' форматирование» и применяет стили приёмника. Selection.PasteAndFormat —
-' буквально тот же код, что выполняется при ручной вставке мышкой.
-Private Const PASTE_VIA_SELECTION As Boolean = True
-
-Private Const wdStory As Long = 6
-
-
 Private Sub AppendPartToMaster(wdApp As Object, wdMaster As Object, _
                                ByVal filePath As String, ByVal isFirstPart As Boolean)
 
