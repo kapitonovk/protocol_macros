@@ -67,6 +67,11 @@ Private Const COPY_STYLES_FROM_DONOR As Boolean = False
 
 Private Const wdKeepSourceFormatting As Long = 0
 
+' Собирать при видимом Word. Невидимый экземпляр откладывает раскладку,
+' и таблицы с автоподбором по окну пересчитываются по неверной ширине.
+' Именно поэтому отдельно собранный appendix при Visible = True выглядит нормально.
+Private Const BUILD_WITH_WORD_VISIBLE As Boolean = True
+
 ' Переносить содержимое колонтитулов частей (если они непустые)
 Private Const COPY_HEADERS_FOOTERS As Boolean = True
 
@@ -171,8 +176,11 @@ Public Sub BuildProtocol()
 
     ' ---- 3. Word, настройки вставки и пустой master из донора стилей ----
     Set wdApp = CreateObject("Word.Application")
-    wdApp.Visible = False
+    wdApp.Visible = BUILD_WITH_WORD_VISIBLE
     wdApp.DisplayAlerts = 0
+    On Error Resume Next
+    wdApp.ScreenUpdating = False
+    On Error GoTo Fail
 
     If FORCE_KEEP_SOURCE_PASTE_OPTIONS Then
         On Error Resume Next
@@ -284,6 +292,10 @@ Public Sub BuildProtocol()
         On Error GoTo Fail
     End If
 
+    On Error Resume Next
+    wdApp.ScreenUpdating = True
+    On Error GoTo Fail
+
     If SHOW_RESULT Then
         wdApp.Visible = True
         wdApp.Activate
@@ -313,6 +325,7 @@ Fail:
             wdApp.Options.PasteFormatBetweenDocuments = optBetween
             wdApp.Options.PasteFormatBetweenStyledDocuments = optStyled
         End If
+        wdApp.ScreenUpdating = True
         wdApp.Visible = True
         wdApp.DisplayAlerts = -1
     End If
@@ -328,6 +341,20 @@ End Sub
 ' ============================================================
 ' МЕРДЖ ОДНОЙ ЧАСТИ В MASTER С СОХРАНЕНИЕМ ОФОРМЛЕНИЯ
 ' ============================================================
+' Посекционный мердж: для каждой секции источника в master создаётся своя
+' секция с теми же параметрами страницы, и туда вставляется только её
+' содержимое. Это точный аналог ручного «выделил кусок — Ctrl+C — Ctrl+V».
+Private Const MERGE_BY_SECTION As Boolean = True
+
+' Вставлять через Selection, а не через Range.
+' Range.PasteAndFormat в части случаев игнорирует «сохранить исходное
+' форматирование» и применяет стили приёмника. Selection.PasteAndFormat —
+' буквально тот же код, что выполняется при ручной вставке мышкой.
+Private Const PASTE_VIA_SELECTION As Boolean = True
+
+Private Const wdStory As Long = 6
+
+
 Private Sub AppendPartToMaster(wdApp As Object, wdMaster As Object, _
                                ByVal filePath As String, ByVal isFirstPart As Boolean)
 
@@ -335,6 +362,8 @@ Private Sub AppendPartToMaster(wdApp As Object, wdMaster As Object, _
     Dim rng As Object
     Dim srcRange As Object
     Dim newSecIdx As Long
+    Dim k As Long
+    Dim secCount As Long
 
     If Not MERGE_KEEP_SOURCE_FORMATTING Then
         Call AppendFileToMaster_Legacy(wdMaster, filePath)
@@ -344,47 +373,66 @@ Private Sub AppendPartToMaster(wdApp As Object, wdMaster As Object, _
     Set srcDoc = wdApp.Documents.Open(Filename:=filePath, ReadOnly:=True, _
                                       AddToRecentFiles:=False, Visible:=False)
 
-    ' --- секция под вставляемую часть ---
-    ' Первая часть (титульник) идёт в уже существующую пустую секцию master,
-    ' иначе перед ней осталась бы пустая страница.
-    If isFirstPart Then
-        newSecIdx = 1
+    If MERGE_BY_SECTION Then
+        secCount = srcDoc.Sections.Count
     Else
-        Set rng = wdMaster.Content
-        rng.Collapse wdCollapseEnd
-        rng.InsertBreak wdSectionBreakNextPage
-        newSecIdx = wdMaster.Sections.Count
+        secCount = 1
     End If
 
-    Call UnlinkHeadersFooters(wdMaster.Sections(newSecIdx))
-    Call CopyPageSetup(srcDoc.Sections(1).PageSetup, wdMaster.Sections(newSecIdx).PageSetup)
+    For k = 1 To secCount
 
-    If COPY_HEADERS_FOOTERS Then
-        Call CopyHeadersFooters(srcDoc.Sections(1), wdMaster.Sections(newSecIdx))
-    End If
+        ' --- секция-приёмник ---
+        ' Самая первая вставка идёт в уже существующую пустую секцию master,
+        ' иначе перед титульником осталась бы пустая страница.
+        If isFirstPart And k = 1 Then
+            newSecIdx = 1
+        Else
+            Set rng = wdMaster.Content
+            rng.Collapse wdCollapseEnd
+            rng.InsertBreak wdSectionBreakNextPage
+            newSecIdx = wdMaster.Sections.Count
+        End If
 
-    ' --- содержимое без финального ¶ (иначе плодятся пустые абзацы) ---
-    If srcDoc.Content.End - 1 > srcDoc.Content.Start Then
-        Set srcRange = srcDoc.Range(srcDoc.Content.Start, srcDoc.Content.End - 1)
-    Else
-        Set srcRange = srcDoc.Content
-    End If
+        Call UnlinkHeadersFooters(wdMaster.Sections(newSecIdx))
+        Call CopyPageSetup(srcDoc.Sections(k).PageSetup, _
+                           wdMaster.Sections(newSecIdx).PageSetup)
 
-    srcRange.Copy
+        If COPY_HEADERS_FOOTERS Then
+            Call CopyHeadersFooters(srcDoc.Sections(k), wdMaster.Sections(newSecIdx))
+        End If
 
-    Set rng = wdMaster.Content
-    rng.Collapse wdCollapseEnd
-    Call PasteKeepSource(rng)
+        ' --- содержимое без замыкающего знака секции / финального ¶ ---
+        If MERGE_BY_SECTION Then
+            Set srcRange = srcDoc.Sections(k).Range
+        Else
+            Set srcRange = srcDoc.Content
+        End If
 
-    ' --- PageSetup последней секции источника хранится в финальном ¶
-    '     и через буфер не переносится: копируем руками ---
-    Call CopyPageSetup(srcDoc.Sections(srcDoc.Sections.Count).PageSetup, _
-                       wdMaster.Sections(wdMaster.Sections.Count).PageSetup)
+        If srcRange.End - 1 > srcRange.Start Then
+            Set srcRange = srcDoc.Range(srcRange.Start, srcRange.End - 1)
+        End If
 
-    If COPY_HEADERS_FOOTERS Then
-        Call UnlinkHeadersFooters(wdMaster.Sections(wdMaster.Sections.Count))
-        Call CopyHeadersFooters(srcDoc.Sections(srcDoc.Sections.Count), _
-                                wdMaster.Sections(wdMaster.Sections.Count))
+        srcRange.Copy
+
+        Call PasteKeepSource(wdApp, wdMaster)
+
+        ' --- PageSetup прогоняем повторно: вставка может принести
+        '     свои параметры страницы и сломать альбомную ориентацию ---
+        Call CopyPageSetup(srcDoc.Sections(k).PageSetup, _
+                           wdMaster.Sections(wdMaster.Sections.Count).PageSetup)
+
+    Next k
+
+    ' Если мерджили целиком — PageSetup последней секции источника хранится
+    ' в финальном ¶ и через буфер не переносится.
+    If Not MERGE_BY_SECTION Then
+        Call CopyPageSetup(srcDoc.Sections(srcDoc.Sections.Count).PageSetup, _
+                           wdMaster.Sections(wdMaster.Sections.Count).PageSetup)
+        If COPY_HEADERS_FOOTERS Then
+            Call UnlinkHeadersFooters(wdMaster.Sections(wdMaster.Sections.Count))
+            Call CopyHeadersFooters(srcDoc.Sections(srcDoc.Sections.Count), _
+                                    wdMaster.Sections(wdMaster.Sections.Count))
+        End If
     End If
 
     srcDoc.Close SaveChanges:=False
@@ -411,14 +459,26 @@ End Sub
 
 ' Вставка «сохранить исходное форматирование» с ретраями:
 ' буфер обмена иногда занят другим процессом.
-Private Sub PasteKeepSource(rng As Object)
+Private Sub PasteKeepSource(wdApp As Object, wdMaster As Object)
 
     Dim attempt As Long
+    Dim rng As Object
 
     For attempt = 1 To 5
         Err.Clear
         On Error Resume Next
-        rng.PasteAndFormat wdFormatOriginalFormatting
+
+        If PASTE_VIA_SELECTION Then
+            wdMaster.Activate
+            wdApp.Selection.EndKey Unit:=wdStory
+            wdApp.Selection.Collapse wdCollapseEnd
+            wdApp.Selection.PasteAndFormat wdFormatOriginalFormatting
+        Else
+            Set rng = wdMaster.Content
+            rng.Collapse wdCollapseEnd
+            rng.PasteAndFormat wdFormatOriginalFormatting
+        End If
+
         If Err.Number = 0 Then
             On Error GoTo 0
             Exit Sub
