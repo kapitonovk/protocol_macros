@@ -1,6 +1,15 @@
 Attribute VB_Name = "make_body"
 Option Explicit
 
+' --- Флаги нумерации строк таблицы body -------------------------------
+' Писать номера строк в колонку 1 из VBA (1..N внутри каждой таблицы body).
+Private Const WRITE_ROW_NUMBERS As Boolean = True
+
+' Снимать автонумерацию (нумерованный список) с колонки 1 шаблона.
+' Именно она давала сквозную нумерацию через все body-таблицы и дубль
+' рядом с номером, который пишет VBA. Флаг работает и без правки шаблона.
+Private Const STRIP_LIST_NUMBERING_IN_COL1 As Boolean = True
+
 ' ============================================================
 ' ИЗМЕНЕНИЯ ОТНОСИТЕЛЬНО ПРЕДЫДУЩЕЙ ВЕРСИИ:
 '  1) шаблон body берётся по Sources 0.2 (было 0.1 — это титульник);
@@ -13,6 +22,11 @@ Option Explicit
 '      GetDataScalarByPlaceholder, ReplacePlaceholderInWord) —
 '     иначе вызов из третьего модуля даёт "Ambiguous name";
 '  6) GetConfigValue нормализует дату к dd.mm.yyyy.
+'
+' ---- ПРАВКА 03.08.2026 ----
+'  7) в колонке 1 таблицы body снимается автонумерация шаблона
+'     (ListFormat.RemoveNumbers), номера пишет VBA — по 1..N в каждой
+'     таблице, без сквозной нумерации между разделами.
 ' ============================================================
 
 
@@ -141,12 +155,20 @@ Sub FillTable_BODY_MAIN(wbMain As Workbook, wbData As Workbook, wdBody As Object
         Call InsertEmptyRowsAfter(wdTable, SAMPLE_ROW, rowCount - 1)
     End If
 
+    ' Снимаем автонумерацию с колонки 1: иначе список продолжается
+    ' сквозь все body-таблицы и дублирует номер, который пишет VBA
+    If STRIP_LIST_NUMBERING_IN_COL1 Then
+        Call StripNumberingInColumn1(wdTable)
+    End If
+
     ' Заполняем
     For i = 0 To rowCount - 1
         wordRow = SAMPLE_ROW + i
 
         ' Колонка 1: № п.п.
-        Call SafeSetCellText(wdTable, wordRow, 1, CStr(i + 1))
+        If WRITE_ROW_NUMBERS Then
+            Call SafeSetCellText(wdTable, wordRow, 1, CStr(i + 1))
+        End If
 
         For r = 2 To lastMapRow
             If Trim(CStr(wsMapper.Cells(r, 2).Value)) = "BODY_MAIN" Then
@@ -171,6 +193,32 @@ Sub FillTable_BODY_MAIN(wbMain As Workbook, wbData As Workbook, wdBody As Object
             End If
         Next r
     Next i
+
+End Sub
+
+
+' ============================================================
+' Снятие автонумерации с первой колонки.
+' Сначала пробуем целиком по колонке, при merged cells Word отдаёт
+' ошибку 5991 — тогда идём поячеечно.
+' ============================================================
+Private Sub StripNumberingInColumn1(wdTable As Object)
+
+    Dim rowIdx As Long
+
+    On Error Resume Next
+    Err.Clear
+    wdTable.Columns(1).Range.ListFormat.RemoveNumbers
+
+    If Err.Number <> 0 Then
+        Err.Clear
+        For rowIdx = 1 To wdTable.Rows.Count
+            wdTable.Cell(rowIdx, 1).Range.ListFormat.RemoveNumbers
+            Err.Clear
+        Next rowIdx
+    End If
+
+    On Error GoTo 0
 
 End Sub
 

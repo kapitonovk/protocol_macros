@@ -10,29 +10,49 @@ Option Explicit
 '   2. лист согласования    (Sources 0.3)
 '   3. appendix x N         (Sources 0.4)  — по одному на каждый data-источник
 '
-' Модуль make_appx НЕ изменяется: его публичные функции вызываются как есть.
-' Модуль make_body изменён только в части параметризации (см. make_body).
+' Модуль make_appx НЕ изменяется.
+'
+' ---- ПРАВКИ 03.08.2026 (потеря оформления при мердже) ----
+' Причина: Range.InsertFile не импортирует стили. Вставляемый текст
+' сохраняет ИМЕНА стилей, но начинает подчиняться ОПРЕДЕЛЕНИЯМ стилей
+' master-документа (он создаётся из титульника). Отсюда «плавающий» кегль
+' в основном тексте, подзаголовках «Приложение» и таблицах, причём
+' неоднородно: там, где в шаблоне было прямое форматирование поверх стиля,
+' оно уцелело, там, где формат шёл от стиля — переопределился.
+' Плюс InsertFile не переносит параметры страницы последней секции
+' источника, поэтому альбомные таблицы приложения попадали в портретную
+' секцию и «ехали».
+'
+' Решение:
+'   1) вставка через буфер с сохранением исходного форматирования
+'      (PasteAndFormat wdFormatOriginalFormatting) — Word превращает
+'      конфликтующие стили в прямое форматирование, оформление не плывёт;
+'   2) для каждой вставляемой части создаётся новая секция, в которую
+'      копируется PageSetup первой секции источника, а после вставки
+'      PageSetup последней секции источника копируется в последнюю секцию
+'      master (её параметры хранятся в финальном ¶ и через буфер не едут);
+'   3) колонтитулы новой секции отвязываются от предыдущей.
 ' ============================================================
 
 ' --- Поведенческие флаги -------------------------------------------------
-' Заменять ли в тексте шаблонов жёстко прописанные номера разделов
-' ("п. 1.1.1", "Приложению 1.1.2", "Приложении № 1.1.3") на номер
-' текущего источника. Нужно, пока в шаблонах не проставлен {{I}}.
-Private Const FIX_HARDCODED_SECTION_NUMBERS As Boolean = True
-
-' Удалять ли блок "Приложение № 1.x.4 (рассрочка по ДДУ)" из копии
-' приложения, если Тип источника не ДДУ. make_appx при этом не меняется:
-' блок вырезается пост-обработкой уже заполненного документа.
+Private Const FIX_HARDCODED_SECTION_NUMBERS As Boolean = False
 Private Const DROP_DDU_BLOCK_FOR_NON_DDU As Boolean = True
-
-' Открывать результат в Word после сборки
 Private Const SHOW_RESULT As Boolean = True
+
+' Мердж через буфер с сохранением исходного оформления.
+' False — старое поведение (Range.InsertFile), оставлено на случай отката.
+Private Const MERGE_KEEP_SOURCE_FORMATTING As Boolean = True
+
+' Переносить содержимое колонтитулов частей (если они непустые)
+Private Const COPY_HEADERS_FOOTERS As Boolean = True
 
 ' --- Константы Word (позднее связывание) --------------------------------
 Private Const wdCollapseStart As Long = 1
 Private Const wdCollapseEnd As Long = 0
 Private Const wdSectionBreakNextPage As Long = 2
 Private Const wdFormatDocumentDefault As Long = 16
+Private Const wdFormatOriginalFormatting As Long = 16
+Private Const wdStory As Long = 6
 
 
 ' ============================================================
@@ -61,6 +81,7 @@ Public Sub BuildProtocol()
     Dim tmpDir As String
     Dim bodyFiles() As String
     Dim appxFiles() As String
+    Dim approvalFile As String
 
     Dim i As Long
     Dim outPath As String
@@ -125,6 +146,7 @@ Public Sub BuildProtocol()
 
     Set wdMaster = wdApp.Documents.Add(Template:=titlePath)
     Call ApplyConfigScalars(wbMain, wdMaster)
+    Call TrimTrailingEmptyParagraphs(wdMaster)
 
     ' ---- 4. По каждому источнику: body + appendix во временные файлы ----
     For i = 1 To srcCount
@@ -147,7 +169,6 @@ Public Sub BuildProtocol()
         Set wdPart = wdApp.Documents.Add(Template:=appendixPath)
         Call BuildSection_1_1_APPX(wbMain, wbData, wdPart, srcRows(i))
 
-        ' пост-обработка того, что make_appx не закрывает
         If DROP_DDU_BLOCK_FOR_NON_DDU Then
             If UCase(Trim(GetSourceValueByHeader(wbMain, srcRows(i), "Тип"))) <> "ДДУ" Then
                 Call DropDduInstalmentBlock(wdPart)
@@ -174,7 +195,6 @@ Public Sub BuildProtocol()
     Call ApplyConfigScalars(wbMain, wdPart)
     Call TrimTrailingEmptyParagraphs(wdPart)
 
-    Dim approvalFile As String
     approvalFile = tmpDir & "part_approval.docx"
     wdPart.SaveAs2 Filename:=approvalFile, FileFormat:=wdFormatDocumentDefault
     wdPart.Close SaveChanges:=False
@@ -182,16 +202,16 @@ Public Sub BuildProtocol()
 
     ' ---- 6. Мердж: титул -> body x N -> согласование -> appendix x N ----
     For i = 1 To srcCount
-        Call AppendFileToMaster(wdMaster, bodyFiles(i))
+        Call AppendPartToMaster(wdApp, wdMaster, bodyFiles(i))
     Next i
 
-    Call AppendFileToMaster(wdMaster, approvalFile)
+    Call AppendPartToMaster(wdApp, wdMaster, approvalFile)
 
     For i = 1 To srcCount
-        Call AppendFileToMaster(wdMaster, appxFiles(i))
+        Call AppendPartToMaster(wdApp, wdMaster, appxFiles(i))
     Next i
 
-    ' ---- 7. Финальные скаляры на всякий случай + сохранение ----
+    ' ---- 7. Финальные скаляры + сохранение ----
     Call ApplyConfigScalars(wbMain, wdMaster)
 
     outPath = BuildOutputPath(wbMain)
@@ -235,9 +255,180 @@ End Sub
 
 
 ' ============================================================
+' МЕРДЖ ОДНОЙ ЧАСТИ В MASTER С СОХРАНЕНИЕМ ОФОРМЛЕНИЯ
+' ============================================================
+Private Sub AppendPartToMaster(wdApp As Object, wdMaster As Object, ByVal filePath As String)
+
+    Dim srcDoc As Object
+    Dim rng As Object
+    Dim srcRange As Object
+    Dim newSecIdx As Long
+
+    If Not MERGE_KEEP_SOURCE_FORMATTING Then
+        Call AppendFileToMaster_Legacy(wdMaster, filePath)
+        Exit Sub
+    End If
+
+    Set srcDoc = wdApp.Documents.Open(Filename:=filePath, ReadOnly:=True, _
+                                      AddToRecentFiles:=False, Visible:=False)
+
+    ' --- новая секция под вставляемую часть ---
+    Set rng = wdMaster.Content
+    rng.Collapse wdCollapseEnd
+    rng.InsertBreak wdSectionBreakNextPage
+
+    newSecIdx = wdMaster.Sections.Count
+
+    Call UnlinkHeadersFooters(wdMaster.Sections(newSecIdx))
+    Call CopyPageSetup(srcDoc.Sections(1).PageSetup, wdMaster.Sections(newSecIdx).PageSetup)
+
+    If COPY_HEADERS_FOOTERS Then
+        Call CopyHeadersFooters(srcDoc.Sections(1), wdMaster.Sections(newSecIdx))
+    End If
+
+    ' --- содержимое без финального ¶ (иначе плодятся пустые абзацы) ---
+    If srcDoc.Content.End - 1 > srcDoc.Content.Start Then
+        Set srcRange = srcDoc.Range(srcDoc.Content.Start, srcDoc.Content.End - 1)
+    Else
+        Set srcRange = srcDoc.Content
+    End If
+
+    srcRange.Copy
+
+    Set rng = wdMaster.Content
+    rng.Collapse wdCollapseEnd
+    Call PasteKeepSource(rng)
+
+    ' --- PageSetup последней секции источника хранится в финальном ¶
+    '     и через буфер не переносится: копируем руками ---
+    Call CopyPageSetup(srcDoc.Sections(srcDoc.Sections.Count).PageSetup, _
+                       wdMaster.Sections(wdMaster.Sections.Count).PageSetup)
+
+    If COPY_HEADERS_FOOTERS Then
+        Call UnlinkHeadersFooters(wdMaster.Sections(wdMaster.Sections.Count))
+        Call CopyHeadersFooters(srcDoc.Sections(srcDoc.Sections.Count), _
+                                wdMaster.Sections(wdMaster.Sections.Count))
+    End If
+
+    srcDoc.Close SaveChanges:=False
+    Set srcDoc = Nothing
+
+End Sub
+
+
+' Старый способ, оставлен для отката (MERGE_KEEP_SOURCE_FORMATTING = False)
+Private Sub AppendFileToMaster_Legacy(wdMaster As Object, ByVal filePath As String)
+
+    Dim rng As Object
+
+    Set rng = wdMaster.Content
+    rng.Collapse wdCollapseEnd
+    rng.InsertBreak wdSectionBreakNextPage
+
+    Set rng = wdMaster.Content
+    rng.Collapse wdCollapseEnd
+    rng.InsertFile Filename:=filePath, ConfirmConversions:=False, Link:=False, Attachment:=False
+
+End Sub
+
+
+' Вставка «сохранить исходное форматирование» с ретраями:
+' буфер обмена иногда занят другим процессом.
+Private Sub PasteKeepSource(rng As Object)
+
+    Dim attempt As Long
+
+    For attempt = 1 To 5
+        Err.Clear
+        On Error Resume Next
+        rng.PasteAndFormat wdFormatOriginalFormatting
+        If Err.Number = 0 Then
+            On Error GoTo 0
+            Exit Sub
+        End If
+        On Error GoTo 0
+        DoEvents
+        Application.Wait Now + TimeValue("00:00:01")
+    Next attempt
+
+    Err.Raise vbObjectError + 513, "AppendPartToMaster", _
+              "Не удалось вставить часть документа через буфер обмена."
+
+End Sub
+
+
+' ============================================================
+' ПАРАМЕТРЫ СТРАНИЦЫ И КОЛОНТИТУЛЫ
+' ============================================================
+Private Sub CopyPageSetup(srcPS As Object, dstPS As Object)
+
+    On Error Resume Next
+
+    dstPS.Orientation = srcPS.Orientation
+    dstPS.PaperSize = srcPS.PaperSize
+    dstPS.PageWidth = srcPS.PageWidth
+    dstPS.PageHeight = srcPS.PageHeight
+
+    dstPS.TopMargin = srcPS.TopMargin
+    dstPS.BottomMargin = srcPS.BottomMargin
+    dstPS.LeftMargin = srcPS.LeftMargin
+    dstPS.RightMargin = srcPS.RightMargin
+    dstPS.Gutter = srcPS.Gutter
+    dstPS.HeaderDistance = srcPS.HeaderDistance
+    dstPS.FooterDistance = srcPS.FooterDistance
+
+    dstPS.MirrorMargins = srcPS.MirrorMargins
+    dstPS.VerticalAlignment = srcPS.VerticalAlignment
+    dstPS.DifferentFirstPageHeaderFooter = srcPS.DifferentFirstPageHeaderFooter
+    dstPS.OddAndEvenPagesHeaderFooter = srcPS.OddAndEvenPagesHeaderFooter
+
+    On Error GoTo 0
+
+End Sub
+
+
+Private Sub UnlinkHeadersFooters(sec As Object)
+
+    Dim i As Long
+
+    On Error Resume Next
+    For i = 1 To 3
+        sec.Headers(i).LinkToPrevious = False
+        sec.Footers(i).LinkToPrevious = False
+    Next i
+    On Error GoTo 0
+
+End Sub
+
+
+Private Sub CopyHeadersFooters(srcSec As Object, dstSec As Object)
+
+    Dim i As Long
+    Dim t As String
+
+    On Error Resume Next
+
+    For i = 1 To 3
+        t = srcSec.Headers(i).Range.Text
+        t = Replace(Replace(Replace(t, Chr(13), ""), Chr(7), ""), Chr(160), " ")
+        If Trim(t) <> "" Then
+            dstSec.Headers(i).Range.FormattedText = srcSec.Headers(i).Range.FormattedText
+        End If
+
+        t = srcSec.Footers(i).Range.Text
+        t = Replace(Replace(Replace(t, Chr(13), ""), Chr(7), ""), Chr(160), " ")
+        If Trim(t) <> "" Then
+            dstSec.Footers(i).Range.FormattedText = srcSec.Footers(i).Range.FormattedText
+        End If
+    Next i
+
+    On Error GoTo 0
+
+End Sub
+
+
+' ============================================================
 ' СБОР DATA-ИСТОЧНИКОВ ИЗ SOURCES
-' Берём строки, где Номер не содержит точку (то есть не 0.x),
-' файл указан и физически существует.
 ' ============================================================
 Private Function CollectDataSources(wbMain As Workbook, _
                                     ByRef srcNums() As String, _
@@ -277,7 +468,6 @@ Private Function CollectDataSources(wbMain As Workbook, _
 
         numTxt = Trim(CStr(ws.Cells(r, numCol).Value))
 
-        ' служебные строки 0.1 ... 0.6 пропускаем
         If numTxt <> "" And InStr(numTxt, ".") = 0 And InStr(numTxt, ",") = 0 Then
 
             If fileCol > 0 Then
@@ -313,7 +503,7 @@ End Function
 
 
 ' ============================================================
-' СКАЛЯРЫ ИЗ CONFIG (нужны титульнику, листу согласования и body)
+' СКАЛЯРЫ ИЗ CONFIG
 ' ============================================================
 Public Sub ApplyConfigScalars(wbMain As Workbook, wdDoc As Object)
 
@@ -350,7 +540,6 @@ Public Sub FinalizeSectionNumbers(wdDoc As Object, ByVal sourceNumber As String)
 
     sn = Trim(sourceNumber)
 
-    ' опечатка в шаблоне приложения: "1.{{I}.3" (не хватает скобки)
     Call ReplacePlaceholderInWord(wdDoc, "1.{{I}.", "1." & sn & ".")
     Call ReplacePlaceholderInWord(wdDoc, "{{I}}", sn)
 
@@ -369,8 +558,6 @@ End Function
 
 ' ============================================================
 ' УДАЛЕНИЕ БЛОКА "Приложение № 1.x.4" (рассрочка по ДДУ)
-' Блок последний в документе, поэтому режем от его первого абзаца
-' до конца документа вместе с предшествующим разрывом раздела.
 ' ============================================================
 Private Sub DropDduInstalmentBlock(wdDoc As Object)
 
@@ -388,7 +575,7 @@ Private Sub DropDduInstalmentBlock(wdDoc As Object)
         If InStr(1, t, "Приложение", vbTextCompare) > 0 And InStr(t, ".4") > 0 Then
 
             startPos = wdDoc.Paragraphs(p).Range.Start
-            If startPos > 0 Then startPos = startPos - 1   ' забираем разрыв раздела
+            If startPos > 0 Then startPos = startPos - 1
 
             On Error Resume Next
             Set rngDel = wdDoc.Range(startPos, wdDoc.Content.End - 1)
@@ -403,7 +590,7 @@ End Sub
 
 
 ' ============================================================
-' СКОЛЬКО СТРОК ДАННЫХ В VECTOR-БЛОКЕ MAPPER (для {{КВАРТИРЫ_СЧЕТ}})
+' СКОЛЬКО СТРОК ДАННЫХ В VECTOR-БЛОКЕ MAPPER
 ' ============================================================
 Public Function CountVectorRows(wbMain As Workbook, wbData As Workbook, ByVal blockName As String) As Long
 
@@ -456,28 +643,7 @@ End Function
 
 
 ' ============================================================
-' МЕРДЖ ЧАСТИ В MASTER
-' Разрыв раздела "со следующей страницы" сохраняет ориентацию
-' и параметры страниц вставляемого документа.
-' ============================================================
-Private Sub AppendFileToMaster(wdMaster As Object, ByVal filePath As String)
-
-    Dim rng As Object
-
-    Set rng = wdMaster.Content
-    rng.Collapse wdCollapseEnd
-    rng.InsertBreak wdSectionBreakNextPage
-
-    Set rng = wdMaster.Content
-    rng.Collapse wdCollapseEnd
-    rng.InsertFile Filename:=filePath, ConfirmConversions:=False, Link:=False, Attachment:=False
-
-End Sub
-
-
-' ============================================================
-' Чистит хвостовые пустые абзацы части, чтобы при мердже
-' не копились пустые страницы. Абзацы внутри таблиц не трогаем.
+' Чистка хвостовых пустых абзацев части
 ' ============================================================
 Private Sub TrimTrailingEmptyParagraphs(wdDoc As Object)
 
@@ -488,7 +654,6 @@ Private Sub TrimTrailingEmptyParagraphs(wdDoc As Object)
 
     For guard = 1 To 20
         If wdDoc.Paragraphs.Count <= 1 Then Exit Sub
-
         If wdDoc.Paragraphs(wdDoc.Paragraphs.Count).Range.Tables.Count > 0 Then Exit Sub
 
         t = wdDoc.Paragraphs(wdDoc.Paragraphs.Count).Range.Text
