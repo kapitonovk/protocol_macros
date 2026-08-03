@@ -43,6 +43,30 @@ Private Const SHOW_RESULT As Boolean = True
 ' False — старое поведение (Range.InsertFile), оставлено на случай отката.
 Private Const MERGE_KEEP_SOURCE_FORMATTING As Boolean = True
 
+' ---- ПРАВКА 2 от 03.08.2026 -------------------------------------------
+' Master-документ создаётся НЕ из титульника, а из шаблона-донора стилей.
+' У title.docx набор стилей другой родословной: одноимённые стили имеют
+' другие styleId (Normal = "Normal" против "a1", Table Grid = "TableGrid"
+' против "a7"), а один и тот же id значит разные стили (id "13" в титуле —
+' "Сетка таблицы13" 14 пт, в body/appendix — основной текст 11 пт).
+' body, approval и appendix при этом идентичны друг другу по стилям.
+' Поэтому донором делаем body (0.2), а титульник вставляем как обычную
+' часть — он на 100% свёрстан прямым форматированием и переносится нормально.
+Private Const MASTER_STYLE_SOURCE_NUMBER As String = "0.2"
+
+' Word по умолчанию для случая "вставка между документами при конфликте
+' определений стилей" применяет Use Destination Styles — и переопределяет
+' даже PasteAndFormat. Принудительно ставим Keep Source Formatting на время
+' сборки и возвращаем прежние значения после.
+Private Const FORCE_KEEP_SOURCE_PASTE_OPTIONS As Boolean = True
+
+' Приводить стили каждой части к донорским перед сохранением.
+' Крайняя мера: убирает конфликты полностью, но перебивает собственные
+' определения стилей титульника.
+Private Const COPY_STYLES_FROM_DONOR As Boolean = False
+
+Private Const wdKeepSourceFormatting As Long = 0
+
 ' Переносить содержимое колонтитулов частей (если они непустые)
 Private Const COPY_HEADERS_FOOTERS As Boolean = True
 
@@ -82,6 +106,12 @@ Public Sub BuildProtocol()
     Dim bodyFiles() As String
     Dim appxFiles() As String
     Dim approvalFile As String
+    Dim titleFile As String
+    Dim stylePath As String
+
+    Dim optBetween As Long
+    Dim optStyled As Long
+    Dim optsSaved As Boolean
 
     Dim i As Long
     Dim outPath As String
@@ -139,14 +169,28 @@ Public Sub BuildProtocol()
 
     On Error GoTo Fail
 
-    ' ---- 3. Word и master-документ (титульник) ----
+    ' ---- 3. Word, настройки вставки и пустой master из донора стилей ----
     Set wdApp = CreateObject("Word.Application")
     wdApp.Visible = False
     wdApp.DisplayAlerts = 0
 
-    Set wdMaster = wdApp.Documents.Add(Template:=titlePath)
-    Call ApplyConfigScalars(wbMain, wdMaster)
-    Call TrimTrailingEmptyParagraphs(wdMaster)
+    If FORCE_KEEP_SOURCE_PASTE_OPTIONS Then
+        On Error Resume Next
+        Err.Clear
+        optBetween = wdApp.Options.PasteFormatBetweenDocuments
+        optStyled = wdApp.Options.PasteFormatBetweenStyledDocuments
+        wdApp.Options.PasteFormatBetweenDocuments = wdKeepSourceFormatting
+        wdApp.Options.PasteFormatBetweenStyledDocuments = wdKeepSourceFormatting
+        optsSaved = (Err.Number = 0)
+        On Error GoTo Fail
+    End If
+
+    stylePath = GetSourcePathByNumber(wbMain, MASTER_STYLE_SOURCE_NUMBER)
+    If Not FileExists(stylePath) Then stylePath = bodyPath
+
+    ' master = документ с донорскими стилями и пустым содержимым
+    Set wdMaster = wdApp.Documents.Add(Template:=stylePath)
+    wdMaster.Content.Delete
 
     ' ---- 4. По каждому источнику: body + appendix во временные файлы ----
     For i = 1 To srcCount
@@ -159,6 +203,7 @@ Public Sub BuildProtocol()
         Call ApplyConfigScalars(wbMain, wdPart)
         Call FinalizeSectionNumbers(wdPart, srcNums(i))
         Call TrimTrailingEmptyParagraphs(wdPart)
+        If COPY_STYLES_FROM_DONOR Then wdPart.CopyStylesFromTemplate stylePath
 
         bodyFiles(i) = tmpDir & "part_body_" & Format(i, "00") & ".docx"
         wdPart.SaveAs2 Filename:=bodyFiles(i), FileFormat:=wdFormatDocumentDefault
@@ -180,6 +225,7 @@ Public Sub BuildProtocol()
         Call ApplyConfigScalars(wbMain, wdPart)
         Call FinalizeSectionNumbers(wdPart, srcNums(i))
         Call TrimTrailingEmptyParagraphs(wdPart)
+        If COPY_STYLES_FROM_DONOR Then wdPart.CopyStylesFromTemplate stylePath
 
         appxFiles(i) = tmpDir & "part_appx_" & Format(i, "00") & ".docx"
         wdPart.SaveAs2 Filename:=appxFiles(i), FileFormat:=wdFormatDocumentDefault
@@ -190,10 +236,22 @@ Public Sub BuildProtocol()
         Set wbData = Nothing
     Next i
 
+    ' ---- 4a. Титульник как обычная часть ----
+    Set wdPart = wdApp.Documents.Add(Template:=titlePath)
+    Call ApplyConfigScalars(wbMain, wdPart)
+    Call TrimTrailingEmptyParagraphs(wdPart)
+    If COPY_STYLES_FROM_DONOR Then wdPart.CopyStylesFromTemplate stylePath
+
+    titleFile = tmpDir & "part_title.docx"
+    wdPart.SaveAs2 Filename:=titleFile, FileFormat:=wdFormatDocumentDefault
+    wdPart.Close SaveChanges:=False
+    Set wdPart = Nothing
+
     ' ---- 5. Лист согласования во временный файл ----
     Set wdPart = wdApp.Documents.Add(Template:=approvalPath)
     Call ApplyConfigScalars(wbMain, wdPart)
     Call TrimTrailingEmptyParagraphs(wdPart)
+    If COPY_STYLES_FROM_DONOR Then wdPart.CopyStylesFromTemplate stylePath
 
     approvalFile = tmpDir & "part_approval.docx"
     wdPart.SaveAs2 Filename:=approvalFile, FileFormat:=wdFormatDocumentDefault
@@ -201,14 +259,16 @@ Public Sub BuildProtocol()
     Set wdPart = Nothing
 
     ' ---- 6. Мердж: титул -> body x N -> согласование -> appendix x N ----
+    Call AppendPartToMaster(wdApp, wdMaster, titleFile, True)
+
     For i = 1 To srcCount
-        Call AppendPartToMaster(wdApp, wdMaster, bodyFiles(i))
+        Call AppendPartToMaster(wdApp, wdMaster, bodyFiles(i), False)
     Next i
 
-    Call AppendPartToMaster(wdApp, wdMaster, approvalFile)
+    Call AppendPartToMaster(wdApp, wdMaster, approvalFile, False)
 
     For i = 1 To srcCount
-        Call AppendPartToMaster(wdApp, wdMaster, appxFiles(i))
+        Call AppendPartToMaster(wdApp, wdMaster, appxFiles(i), False)
     Next i
 
     ' ---- 7. Финальные скаляры + сохранение ----
@@ -216,6 +276,13 @@ Public Sub BuildProtocol()
 
     outPath = BuildOutputPath(wbMain)
     wdMaster.SaveAs2 Filename:=outPath, FileFormat:=wdFormatDocumentDefault
+
+    If optsSaved Then
+        On Error Resume Next
+        wdApp.Options.PasteFormatBetweenDocuments = optBetween
+        wdApp.Options.PasteFormatBetweenStyledDocuments = optStyled
+        On Error GoTo Fail
+    End If
 
     If SHOW_RESULT Then
         wdApp.Visible = True
@@ -242,6 +309,10 @@ Fail:
     If Not wbData Is Nothing Then wbData.Close SaveChanges:=False
     If Not wdPart Is Nothing Then wdPart.Close SaveChanges:=False
     If Not wdApp Is Nothing Then
+        If optsSaved Then
+            wdApp.Options.PasteFormatBetweenDocuments = optBetween
+            wdApp.Options.PasteFormatBetweenStyledDocuments = optStyled
+        End If
         wdApp.Visible = True
         wdApp.DisplayAlerts = -1
     End If
@@ -257,7 +328,8 @@ End Sub
 ' ============================================================
 ' МЕРДЖ ОДНОЙ ЧАСТИ В MASTER С СОХРАНЕНИЕМ ОФОРМЛЕНИЯ
 ' ============================================================
-Private Sub AppendPartToMaster(wdApp As Object, wdMaster As Object, ByVal filePath As String)
+Private Sub AppendPartToMaster(wdApp As Object, wdMaster As Object, _
+                               ByVal filePath As String, ByVal isFirstPart As Boolean)
 
     Dim srcDoc As Object
     Dim rng As Object
@@ -272,12 +344,17 @@ Private Sub AppendPartToMaster(wdApp As Object, wdMaster As Object, ByVal filePa
     Set srcDoc = wdApp.Documents.Open(Filename:=filePath, ReadOnly:=True, _
                                       AddToRecentFiles:=False, Visible:=False)
 
-    ' --- новая секция под вставляемую часть ---
-    Set rng = wdMaster.Content
-    rng.Collapse wdCollapseEnd
-    rng.InsertBreak wdSectionBreakNextPage
-
-    newSecIdx = wdMaster.Sections.Count
+    ' --- секция под вставляемую часть ---
+    ' Первая часть (титульник) идёт в уже существующую пустую секцию master,
+    ' иначе перед ней осталась бы пустая страница.
+    If isFirstPart Then
+        newSecIdx = 1
+    Else
+        Set rng = wdMaster.Content
+        rng.Collapse wdCollapseEnd
+        rng.InsertBreak wdSectionBreakNextPage
+        newSecIdx = wdMaster.Sections.Count
+    End If
 
     Call UnlinkHeadersFooters(wdMaster.Sections(newSecIdx))
     Call CopyPageSetup(srcDoc.Sections(1).PageSetup, wdMaster.Sections(newSecIdx).PageSetup)
@@ -718,6 +795,73 @@ Private Sub CleanupTempDir(ByVal tmpDir As String)
     If tmpDir = "" Then Exit Sub
     Kill tmpDir & "*.docx"
     RmDir Left$(tmpDir, Len(tmpDir) - 1)
+
+End Sub
+
+
+' ============================================================
+' ДИАГНОСТИКА: где расходятся определения одноимённых стилей
+' в двух шаблонах. Запускать вручную, отчёт ложится рядом с main.xlsx.
+' ============================================================
+Public Sub ReportStyleConflicts()
+
+    Dim wbMain As Workbook
+    Dim wdApp As Object
+    Dim d1 As Object, d2 As Object
+    Dim s1 As Object, s2 As Object
+    Dim p1 As String, p2 As String
+    Dim outFile As String
+    Dim ff As Integer
+    Dim nm As String
+    Dim cnt As Long
+
+    Set wbMain = ThisWorkbook
+    p1 = GetSourcePathByNumber(wbMain, "0.1")                        ' титульник
+    p2 = GetSourcePathByNumber(wbMain, MASTER_STYLE_SOURCE_NUMBER)   ' донор стилей
+
+    If Not FileExists(p1) Or Not FileExists(p2) Then
+        MsgBox "Не найдены шаблоны для сравнения.", vbExclamation
+        Exit Sub
+    End If
+
+    Set wdApp = CreateObject("Word.Application")
+    wdApp.Visible = False
+
+    Set d1 = wdApp.Documents.Open(Filename:=p1, ReadOnly:=True, AddToRecentFiles:=False, Visible:=False)
+    Set d2 = wdApp.Documents.Open(Filename:=p2, ReadOnly:=True, AddToRecentFiles:=False, Visible:=False)
+
+    outFile = wbMain.Path & "\style_conflicts.txt"
+    ff = FreeFile
+    Open outFile For Output As #ff
+
+    Print #ff, "Стиль | " & d1.Name & " | " & d2.Name
+
+    For Each s1 In d1.Styles
+        nm = ""
+        On Error Resume Next
+        nm = s1.NameLocal
+        Set s2 = Nothing
+        Set s2 = d2.Styles(nm)
+        On Error GoTo 0
+
+        If Not s2 Is Nothing Then
+            On Error Resume Next
+            If s1.Font.Size <> s2.Font.Size Or s1.Font.Name <> s2.Font.Name Then
+                Print #ff, nm & " | " & s1.Font.Name & " " & s1.Font.Size & " | " & _
+                                       s2.Font.Name & " " & s2.Font.Size
+                cnt = cnt + 1
+            End If
+            On Error GoTo 0
+        End If
+    Next s1
+
+    Close #ff
+
+    d1.Close SaveChanges:=False
+    d2.Close SaveChanges:=False
+    wdApp.Quit
+
+    MsgBox "Расхождений по одноимённым стилям: " & cnt & vbCrLf & outFile, vbInformation
 
 End Sub
 
