@@ -96,6 +96,65 @@ Private Const CACHE_SOURCES_LOCALLY As Boolean = True
 ' Показывать прогресс в строке состояния Excel (левый низ)
 Private Const SHOW_PROGRESS As Boolean = True
 
+' Пути в Sources можно писать относительно папки с xlsm, например:
+'   шаблоны\0.1template.title.docx
+'   .\data\1_Ленина_15.xlsx
+'   ..\_шаблоны\0.4template.appendix.docx
+' Абсолютные и UNC-пути продолжают работать как раньше.
+' С относительными путями папку протокола можно копировать целиком и не
+' переписывать Sources для каждого нового протокола.
+Private Const RESOLVE_RELATIVE_PATHS As Boolean = True
+
+' Справочные файлы 0.5 (ПОДБОР писем) и 0.6 (ddu_data) открывает make_appx
+' сам, беря путь из Sources. Чтобы не трогать make_appx, на время сборки
+' подменяем значение этих ячеек на пути локальных копий и возвращаем
+' исходные значения в конце (и в обработчике ошибок). Книга макросом
+' не сохраняется, так что даже при аварии достаточно закрыть без сохранения.
+Private Const CACHE_LOOKUP_FILES_LOCALLY As Boolean = True
+
+Private lookupRows() As Long
+Private lookupVals() As String
+Private lookupCount As Long
+Private lookupCol As Long
+
+' ---- ХАРДКОД ОФОРМЛЕНИЯ (04.08.2026) ------------------------------
+' Точечные правки конкретных таблиц после заполнения и до мерджа.
+' Применяются к частям, а не к шаблонам — файлы шаблонов не меняются.
+Private Const HARDCODE_FORMATTING As Boolean = True
+
+' Таблица основного раздела (шаблон 0.2, Tables(1))
+Private Const BODY_TABLE_INDEX As Long = 1
+Private Const BODY_TABLE_FONT_SIZE As Single = 7
+
+' APPX_112 — аналоги-аукционы, Tables(3) в шаблоне 0.4
+Private Const APPX_112_TABLE_INDEX As Long = 3
+Private Const APPX_112_FONT_SIZE As Single = 9
+
+' APPX_113b — ценообразование по квартирам, Tables(5) в шаблоне 0.4.
+' После вставки уезжала левым краем на ≈ -1.21 см, нужно -0.5 см и кегель 7.
+Private Const APPX_113B_TABLE_INDEX As Long = 5
+Private Const APPX_113B_FONT_SIZE As Single = 7
+Private Const APPX_113B_LEFT_INDENT_CM As Single = -0.5
+' Фиксировать ширину 113b: отключить автоподбор, чтобы вставка её не тянула
+Private Const APPX_113B_LOCK_WIDTH As Boolean = True
+
+' В основном разделе текстовые абзацы (1.x., 1.x.1, 1.x.2 и т.д.) сидят
+' на автонумерации списка поверх своего же текстового номера.
+' Снимаем нумерацию списка, сам текст и номера остаются на месте.
+Private Const STRIP_LIST_NUMBERING_IN_BODY_TEXT As Boolean = True
+
+' Как именно снимать список:
+'   1 = ConvertNumbersToText — автономер превращается в обычный текст.
+'       Безопасно: ничего не пропадает, абзац перестаёт быть пунктом списка.
+'   2 = RemoveNumbers — автономер удаляется совсем.
+'       Ставить, если после режима 1 номера дублируются
+'       (автономер плюс свой текстовый номер вида 1.2.1.).
+Private Const BODY_LIST_FIX_MODE As Long = 1
+
+Private Const wdNumberParagraph As Long = 1
+Private Const wdWithInTable As Long = 12
+Private Const wdAdjustNone As Long = 0
+
 Private Const wdWindowStateNormal As Long = 0
 Private Const wdWindowStateMinimize As Long = 2
 
@@ -151,10 +210,11 @@ Public Sub BuildProtocol()
     Set wsSources = wbMain.Worksheets("Sources")
 
     ' ---- 1. Пути к служебным шаблонам ----
-    titlePath = GetSourcePathByNumber(wbMain, "0.1")
-    bodyPath = GetSourcePathByNumber(wbMain, "0.2")
-    approvalPath = GetSourcePathByNumber(wbMain, "0.3")
-    appendixPath = GetSourcePathByNumber(wbMain, "0.4")
+    ' пути могут быть относительными к папке, где лежит эта книга
+    titlePath = ResolvePath(wbMain, GetSourcePathByNumber(wbMain, "0.1"))
+    bodyPath = ResolvePath(wbMain, GetSourcePathByNumber(wbMain, "0.2"))
+    approvalPath = ResolvePath(wbMain, GetSourcePathByNumber(wbMain, "0.3"))
+    appendixPath = ResolvePath(wbMain, GetSourcePathByNumber(wbMain, "0.4"))
 
     If Not FileExists(titlePath) Then
         MsgBox "Не найден шаблон титульника (Sources 0.1): " & titlePath, vbExclamation
@@ -209,6 +269,11 @@ Public Sub BuildProtocol()
             Call Progress("копирование data-файла " & i & " из " & srcCount & "...")
             srcPaths(i) = LocalCopy(srcPaths(i), tmpDir, "data_" & Format(i, "00"))
         Next i
+
+        If CACHE_LOOKUP_FILES_LOCALLY Then
+            Call Progress("копирование справочников...")
+            Call PrepareLookupFiles(wbMain, tmpDir)
+        End If
     End If
 
     ' ---- 3. Word, настройки вставки и пустой master из донора стилей ----
@@ -272,6 +337,7 @@ Public Sub BuildProtocol()
         Call BuildBodyDoc(wbMain, wbData, wdPart, srcNums(i), srcRows(i))
         Call ApplyConfigScalars(wbMain, wdPart)
         Call FinalizeSectionNumbers(wdPart, srcNums(i))
+        Call ApplyBodyHardcode(wdPart)
         Call TrimTrailingEmptyParagraphs(wdPart)
         If COPY_STYLES_FROM_DONOR Then wdPart.CopyStylesFromTemplate stylePath
 
@@ -295,6 +361,7 @@ Public Sub BuildProtocol()
                                       CStr(CountVectorRows(wbMain, wbData, "APPX_112")))
         Call ApplyConfigScalars(wbMain, wdPart)
         Call FinalizeSectionNumbers(wdPart, srcNums(i))
+        Call ApplyAppendixHardcode(wdPart)
         Call TrimTrailingEmptyParagraphs(wdPart)
         If COPY_STYLES_FROM_DONOR Then wdPart.CopyStylesFromTemplate stylePath
 
@@ -367,6 +434,7 @@ Public Sub BuildProtocol()
     wdApp.ScreenRefresh
     On Error GoTo Fail
 
+    Call RestoreLookupFiles(wbMain)
     Call ProgressDone
 
     If SHOW_RESULT Then
@@ -403,6 +471,7 @@ Fail:
         wdApp.Visible = True
         wdApp.DisplayAlerts = -1
     End If
+    Call RestoreLookupFiles(wbMain)
     Call ProgressDone
     Application.ScreenUpdating = prevScreen
     Application.DisplayAlerts = prevAlerts
@@ -678,6 +747,8 @@ Private Function CollectDataSources(wbMain As Workbook, _
             pathTxt = Replace(pathTxt, Chr(160), " ")
             pathTxt = Trim(pathTxt)
 
+            pathTxt = ResolvePath(wbMain, pathTxt)
+
             If fileTxt <> "" And pathTxt <> "" Then
                 If FileExists(pathTxt) Then
                     n = n + 1
@@ -871,6 +942,90 @@ End Sub
 ' ФАЙЛОВЫЕ УТИЛИТЫ
 ' ============================================================
 ' ============================================================
+' ТОЧЕЧНЫЙ ХАРДКОД ОФОРМЛЕНИЯ
+' ============================================================
+' Основной раздел: кегель таблицы + снятие автонумерации с абзацев.
+Private Sub ApplyBodyHardcode(wdDoc As Object)
+
+    If Not HARDCODE_FORMATTING Then Exit Sub
+
+    On Error Resume Next
+
+    If wdDoc.Tables.Count >= BODY_TABLE_INDEX Then
+        wdDoc.Tables(BODY_TABLE_INDEX).Range.Font.Size = BODY_TABLE_FONT_SIZE
+    End If
+
+    Err.Clear
+    On Error GoTo 0
+
+    If STRIP_LIST_NUMBERING_IN_BODY_TEXT Then Call StripListNumberingOutsideTables(wdDoc)
+
+End Sub
+
+
+' Приложение: APPX_112 — кегель 9; APPX_113b — кегель 7 и левый отступ.
+Private Sub ApplyAppendixHardcode(wdDoc As Object)
+
+    Dim tbl As Object
+
+    If Not HARDCODE_FORMATTING Then Exit Sub
+
+    On Error Resume Next
+
+    ' --- APPX_112 ---
+    If wdDoc.Tables.Count >= APPX_112_TABLE_INDEX Then
+        wdDoc.Tables(APPX_112_TABLE_INDEX).Range.Font.Size = APPX_112_FONT_SIZE
+    End If
+
+    ' --- APPX_113b ---
+    If wdDoc.Tables.Count >= APPX_113B_TABLE_INDEX Then
+
+        Set tbl = wdDoc.Tables(APPX_113B_TABLE_INDEX)
+        tbl.Range.Font.Size = APPX_113B_FONT_SIZE
+
+        ' левый отступ без пересчёта ширин колонок (RulerStyle:=wdAdjustNone)
+        tbl.Rows.SetLeftIndent _
+            LeftIndent:=wdDoc.Application.CentimetersToPoints(APPX_113B_LEFT_INDENT_CM), _
+            RulerStyle:=wdAdjustNone
+
+        If APPX_113B_LOCK_WIDTH Then tbl.AllowAutoFit = False
+
+        Set tbl = Nothing
+    End If
+
+    Err.Clear
+    On Error GoTo 0
+
+End Sub
+
+
+' Снимает автонумерацию со всех абзацев вне таблиц.
+' Текст и ручные номера вида "1.2.1." остаются как есть.
+Private Sub StripListNumberingOutsideTables(wdDoc As Object)
+
+    Dim p As Object
+
+    On Error Resume Next
+
+    For Each p In wdDoc.Paragraphs
+        If Not p.Range.Information(wdWithInTable) Then
+            If p.Range.ListFormat.ListType <> 0 Then
+                If BODY_LIST_FIX_MODE = 2 Then
+                    p.Range.ListFormat.RemoveNumbers NumberType:=wdNumberParagraph
+                Else
+                    p.Range.ListFormat.ConvertNumbersToText
+                End If
+            End If
+        End If
+    Next p
+
+    Err.Clear
+    On Error GoTo 0
+
+End Sub
+
+
+' ============================================================
 ' ПРОГРЕСС И ЛОКАЛЬНЫЕ КОПИИ
 ' ============================================================
 Private Sub Progress(ByVal msg As String)
@@ -890,6 +1045,128 @@ Private Sub ProgressDone()
     On Error Resume Next
     Application.StatusBar = False
     On Error GoTo 0
+
+End Sub
+
+
+' Приводит путь из Sources к абсолютному.
+' Абсолютные (C:\...) и UNC (\\server\share\...) отдаёт как есть.
+' Относительные считает от папки, где лежит сама книга (wbMain.Path),
+' включая ".\" и любое количество "..\" в начале.
+Private Function ResolvePath(wbMain As Workbook, ByVal p As String) As String
+
+    Dim baseDir As String
+    Dim rest As String
+    Dim pos As Long
+
+    p = Trim(Replace(p, Chr(160), " "))
+    p = Trim(p)
+    ResolvePath = p
+
+    If p = "" Then Exit Function
+    If Not RESOLVE_RELATIVE_PATHS Then Exit Function
+
+    ' уже абсолютный или UNC
+    If Left$(p, 2) = "\\" Then Exit Function
+    If InStr(p, ":") > 0 Then Exit Function
+
+    baseDir = wbMain.Path
+    If baseDir = "" Then Exit Function
+    If Right$(baseDir, 1) = "\" Then baseDir = Left$(baseDir, Len(baseDir) - 1)
+
+    rest = p
+    Do While Left$(rest, 2) = ".\"
+        rest = Mid$(rest, 3)
+    Loop
+
+    ' каждое "..\" снимает один уровень базового пути
+    Do While Left$(rest, 3) = "..\"
+        rest = Mid$(rest, 4)
+        pos = InStrRev(baseDir, "\")
+        If pos > 2 Then
+            baseDir = Left$(baseDir, pos - 1)
+        Else
+            Exit Do
+        End If
+    Loop
+
+    ' лидирующий \ в Sources трактуем как "от папки книги", не от корня диска
+    Do While Left$(rest, 1) = "\"
+        rest = Mid$(rest, 2)
+    Loop
+
+    If rest = "" Then Exit Function
+
+    ResolvePath = baseDir & "\" & rest
+
+End Function
+
+
+' На время сборки подменяет в Sources пути справочных файлов 0.5 и 0.6
+' на локальные копии. Заодно превращает относительные пути в абсолютные,
+' чтобы make_appx их нашёл без единой правки в том модуле.
+Private Sub PrepareLookupFiles(wbMain As Workbook, ByVal tmpDir As String)
+
+    Dim ws As Worksheet
+    Dim nums As Variant
+    Dim k As Long
+    Dim r As Long
+    Dim raw As String
+    Dim absPath As String
+    Dim locPath As String
+
+    lookupCount = 0
+    nums = Array("0.5", "0.6")
+
+    On Error Resume Next
+    Set ws = wbMain.Worksheets("Sources")
+    lookupCol = FindHeaderColumn(ws, "Путь")
+    If lookupCol = 0 Then Exit Sub
+
+    ReDim lookupRows(1 To UBound(nums) + 1)
+    ReDim lookupVals(1 To UBound(nums) + 1)
+
+    For k = 0 To UBound(nums)
+
+        r = FindSourceRowByNumber(wbMain, CStr(nums(k)))
+        If r > 0 Then
+
+            raw = Trim(CStr(ws.Cells(r, lookupCol).Value))
+            absPath = ResolvePath(wbMain, raw)
+            locPath = LocalCopy(absPath, tmpDir, "ref_" & Replace(CStr(nums(k)), ".", "_"))
+
+            If locPath <> raw And locPath <> "" Then
+                lookupCount = lookupCount + 1
+                lookupRows(lookupCount) = r
+                lookupVals(lookupCount) = raw
+                ws.Cells(r, lookupCol).Value = locPath
+            End If
+        End If
+    Next k
+
+    Err.Clear
+
+End Sub
+
+
+' Возвращает исходные значения ячеек Sources. Вызывается и при успешном
+' завершении, и в обработчике ошибок; повторный вызов безопасен.
+Private Sub RestoreLookupFiles(wbMain As Workbook)
+
+    Dim ws As Worksheet
+    Dim k As Long
+
+    If lookupCount = 0 Then Exit Sub
+
+    On Error Resume Next
+    Set ws = wbMain.Worksheets("Sources")
+
+    For k = 1 To lookupCount
+        ws.Cells(lookupRows(k), lookupCol).Value = lookupVals(k)
+    Next k
+
+    lookupCount = 0
+    Err.Clear
 
 End Sub
 
