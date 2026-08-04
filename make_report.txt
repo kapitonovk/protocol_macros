@@ -86,6 +86,19 @@ Private Const PASTE_VIA_SELECTION As Boolean = True
 ' Переносить содержимое колонтитулов частей (если они непустые)
 Private Const COPY_HEADERS_FOOTERS As Boolean = True
 
+' ---- ПРАВКА 04.08.2026: скорость и сетевой диск --------------------
+' Копировать шаблоны и data-файлы в локальный %TEMP% и собирать из копий.
+' На сетевом диске каждое Documents.Add / Workbooks.Open — это сетевой
+' раундтрип плюс проверка блокировок, и Word может открывать файлы в
+' защищённом режиме. Готовый документ всё равно сохраняется рядом с main.xlsx.
+Private Const CACHE_SOURCES_LOCALLY As Boolean = True
+
+' Показывать прогресс в строке состояния Excel (левый низ)
+Private Const SHOW_PROGRESS As Boolean = True
+
+Private Const wdWindowStateNormal As Long = 0
+Private Const wdWindowStateMinimize As Long = 2
+
 ' --- Константы Word (позднее связывание) --------------------------------
 Private Const wdCollapseStart As Long = 1
 Private Const wdCollapseEnd As Long = 0
@@ -185,12 +198,41 @@ Public Sub BuildProtocol()
 
     On Error GoTo Fail
 
+    ' ---- 2a. Локальные копии исходников (снимает тормоза сетевого диска) ----
+    If CACHE_SOURCES_LOCALLY Then
+        Call Progress("копирование шаблонов локально...")
+        titlePath = LocalCopy(titlePath, tmpDir, "tpl_title")
+        bodyPath = LocalCopy(bodyPath, tmpDir, "tpl_body")
+        approvalPath = LocalCopy(approvalPath, tmpDir, "tpl_approval")
+        appendixPath = LocalCopy(appendixPath, tmpDir, "tpl_appendix")
+        For i = 1 To srcCount
+            Call Progress("копирование data-файла " & i & " из " & srcCount & "...")
+            srcPaths(i) = LocalCopy(srcPaths(i), tmpDir, "data_" & Format(i, "00"))
+        Next i
+    End If
+
     ' ---- 3. Word, настройки вставки и пустой master из донора стилей ----
+    Call Progress("запуск Word...")
     Set wdApp = CreateObject("Word.Application")
-    wdApp.Visible = BUILD_WITH_WORD_VISIBLE
     wdApp.DisplayAlerts = 0
+
+    ' ВАЖНО: видимый Word + ScreenUpdating = False = неперерисованные окна,
+    ' именно поэтому страницы казались пустыми. При видимом Word рисование
+    ' не глушим, а просто сворачиваем окно.
     On Error Resume Next
-    wdApp.ScreenUpdating = False
+    wdApp.Visible = BUILD_WITH_WORD_VISIBLE
+    If BUILD_WITH_WORD_VISIBLE Then
+        wdApp.WindowState = wdWindowStateMinimize
+    Else
+        wdApp.ScreenUpdating = False
+    End If
+
+    ' Отключаем всё, что тормозит сборку
+    wdApp.Options.CheckSpellingAsYouType = False
+    wdApp.Options.CheckGrammarAsYouType = False
+    wdApp.Options.BackgroundSave = False
+    wdApp.Options.SaveInterval = 0
+    wdApp.Options.AnimateScreenMovements = False
     On Error GoTo Fail
 
     If FORCE_KEEP_SOURCE_PASTE_OPTIONS Then
@@ -204,7 +246,14 @@ Public Sub BuildProtocol()
         On Error GoTo Fail
     End If
 
-    stylePath = GetSourcePathByNumber(wbMain, MASTER_STYLE_SOURCE_NUMBER)
+    ' донор стилей: для "0.2" берём уже локальную копию body
+    If MASTER_STYLE_SOURCE_NUMBER = "0.2" Then
+        stylePath = bodyPath
+    ElseIf MASTER_STYLE_SOURCE_NUMBER = "0.4" Then
+        stylePath = appendixPath
+    Else
+        stylePath = GetSourcePathByNumber(wbMain, MASTER_STYLE_SOURCE_NUMBER)
+    End If
     If Not FileExists(stylePath) Then stylePath = bodyPath
 
     ' master = документ с донорскими стилями и пустым содержимым
@@ -214,9 +263,11 @@ Public Sub BuildProtocol()
     ' ---- 4. По каждому источнику: body + appendix во временные файлы ----
     For i = 1 To srcCount
 
+        Call Progress("источник " & i & " из " & srcCount & ": открываю data-файл...")
         Set wbData = Workbooks.Open(Filename:=srcPaths(i), ReadOnly:=True, UpdateLinks:=False)
 
         ' ---- body ----
+        Call Progress("источник " & i & " из " & srcCount & ": формирую основной раздел...")
         Set wdPart = wdApp.Documents.Add(Template:=bodyPath)
         Call BuildBodyDoc(wbMain, wbData, wdPart, srcNums(i), srcRows(i))
         Call ApplyConfigScalars(wbMain, wdPart)
@@ -230,6 +281,7 @@ Public Sub BuildProtocol()
         Set wdPart = Nothing
 
         ' ---- appendix ----
+        Call Progress("источник " & i & " из " & srcCount & ": формирую приложение...")
         Set wdPart = wdApp.Documents.Add(Template:=appendixPath)
         Call BuildSection_1_1_APPX(wbMain, wbData, wdPart, srcRows(i))
 
@@ -256,6 +308,7 @@ Public Sub BuildProtocol()
     Next i
 
     ' ---- 4a. Титульник как обычная часть ----
+    Call Progress("титульный лист...")
     Set wdPart = wdApp.Documents.Add(Template:=titlePath)
     Call ApplyConfigScalars(wbMain, wdPart)
     Call TrimTrailingEmptyParagraphs(wdPart)
@@ -267,6 +320,7 @@ Public Sub BuildProtocol()
     Set wdPart = Nothing
 
     ' ---- 5. Лист согласования во временный файл ----
+    Call Progress("лист согласования...")
     Set wdPart = wdApp.Documents.Add(Template:=approvalPath)
     Call ApplyConfigScalars(wbMain, wdPart)
     Call TrimTrailingEmptyParagraphs(wdPart)
@@ -278,15 +332,19 @@ Public Sub BuildProtocol()
     Set wdPart = Nothing
 
     ' ---- 6. Мердж: титул -> body x N -> согласование -> appendix x N ----
+    Call Progress("сборка: титульник...")
     Call AppendPartToMaster(wdApp, wdMaster, titleFile, True)
 
     For i = 1 To srcCount
+        Call Progress("сборка: основной раздел " & i & " из " & srcCount & "...")
         Call AppendPartToMaster(wdApp, wdMaster, bodyFiles(i), False)
     Next i
 
+    Call Progress("сборка: лист согласования...")
     Call AppendPartToMaster(wdApp, wdMaster, approvalFile, False)
 
     For i = 1 To srcCount
+        Call Progress("сборка: приложение " & i & " из " & srcCount & "...")
         Call AppendPartToMaster(wdApp, wdMaster, appxFiles(i), False)
     Next i
 
@@ -305,7 +363,11 @@ Public Sub BuildProtocol()
 
     On Error Resume Next
     wdApp.ScreenUpdating = True
+    wdApp.WindowState = wdWindowStateNormal
+    wdApp.ScreenRefresh
     On Error GoTo Fail
+
+    Call ProgressDone
 
     If SHOW_RESULT Then
         wdApp.Visible = True
@@ -337,9 +399,11 @@ Fail:
             wdApp.Options.PasteFormatBetweenStyledDocuments = optStyled
         End If
         wdApp.ScreenUpdating = True
+        wdApp.WindowState = wdWindowStateNormal
         wdApp.Visible = True
         wdApp.DisplayAlerts = -1
     End If
+    Call ProgressDone
     Application.ScreenUpdating = prevScreen
     Application.DisplayAlerts = prevAlerts
     On Error GoTo 0
@@ -806,6 +870,57 @@ End Sub
 ' ============================================================
 ' ФАЙЛОВЫЕ УТИЛИТЫ
 ' ============================================================
+' ============================================================
+' ПРОГРЕСС И ЛОКАЛЬНЫЕ КОПИИ
+' ============================================================
+Private Sub Progress(ByVal msg As String)
+
+    If Not SHOW_PROGRESS Then Exit Sub
+
+    On Error Resume Next
+    Application.StatusBar = "Сборка протокола — " & msg
+    DoEvents
+    On Error GoTo 0
+
+End Sub
+
+
+Private Sub ProgressDone()
+
+    On Error Resume Next
+    Application.StatusBar = False
+    On Error GoTo 0
+
+End Sub
+
+
+' Копирует файл в локальную временную папку и возвращает новый путь.
+' Если скопировать не удалось — возвращает исходный путь (работа не встаёт).
+Private Function LocalCopy(ByVal srcPath As String, ByVal tmpDir As String, _
+                          ByVal tag As String) As String
+
+    Dim ext As String
+    Dim dst As String
+    Dim dotPos As Long
+
+    LocalCopy = srcPath
+    If Not FileExists(srcPath) Then Exit Function
+
+    dotPos = InStrRev(srcPath, ".")
+    If dotPos > 0 Then ext = Mid(srcPath, dotPos)
+
+    dst = tmpDir & tag & ext
+
+    On Error Resume Next
+    If Dir(dst) <> "" Then Kill dst
+    FileCopy srcPath, dst
+    If Err.Number = 0 And Dir(dst) <> "" Then LocalCopy = dst
+    Err.Clear
+    On Error GoTo 0
+
+End Function
+
+
 Private Function FileExists(ByVal p As String) As Boolean
 
     Dim res As String
@@ -851,6 +966,10 @@ Private Sub CleanupTempDir(ByVal tmpDir As String)
     On Error Resume Next
     If tmpDir = "" Then Exit Sub
     Kill tmpDir & "*.docx"
+    Kill tmpDir & "*.doc"
+    Kill tmpDir & "*.xlsx"
+    Kill tmpDir & "*.xlsm"
+    Kill tmpDir & "*.xls"
     RmDir Left$(tmpDir, Len(tmpDir) - 1)
 
 End Sub
