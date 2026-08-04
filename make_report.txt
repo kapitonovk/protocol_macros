@@ -35,7 +35,7 @@ Option Explicit
 ' ============================================================
 
 ' --- Поведенческие флаги -------------------------------------------------
-Private Const FIX_HARDCODED_SECTION_NUMBERS As Boolean = False
+Private Const FIX_HARDCODED_SECTION_NUMBERS As Boolean = True
 Private Const DROP_DDU_BLOCK_FOR_NON_DDU As Boolean = True
 Private Const SHOW_RESULT As Boolean = True
 
@@ -138,6 +138,16 @@ Private Const APPX_113B_LEFT_INDENT_CM As Single = -0.5
 ' Фиксировать ширину 113b: отключить автоподбор, чтобы вставка её не тянула
 Private Const APPX_113B_LOCK_WIDTH As Boolean = True
 
+' Первая строка данных в APPX_113b (1-2 — шапка) и нумерация первого столбца
+Private Const APPX_113B_DATA_ROW As Long = 3
+Private Const APPX_113B_WRITE_ROW_NUMBERS As Boolean = True
+
+' Повторно применить точечное оформление УЖЕ В СОБРАННОМ документе.
+' При вставке через буфер Word пересчитывает таблицы под ширину
+' принимающей секции и теряет отступ/кегель, поэтому табличное
+' оформление накатывается второй раз после мерджа.
+Private Const REAPPLY_HARDCODE_AFTER_MERGE As Boolean = True
+
 ' В основном разделе текстовые абзацы (1.x., 1.x.1, 1.x.2 и т.д.) сидят
 ' на автонумерации списка поверх своего же текстового номера.
 ' Снимаем нумерацию списка, сам текст и номера остаются на месте.
@@ -147,8 +157,10 @@ Private Const STRIP_LIST_NUMBERING_IN_BODY_TEXT As Boolean = True
 '   1 = ConvertNumbersToText — автономер превращается в обычный текст.
 '       Безопасно: ничего не пропадает, абзац перестаёт быть пунктом списка.
 '   2 = RemoveNumbers — автономер удаляется совсем.
-'       Ставить, если после режима 1 номера дублируются
-'       (автономер плюс свой текстовый номер вида 1.2.1.).
+'       Ставить только если номера дублируются (автономер плюс свой
+'       текстовый номер вида 1.2.1.).
+'       ВНИМАНИЕ: в режиме 2 коды разделов из автонумерации исчезнут
+'       и FinalizeSectionNumbers их уже не починит.
 Private Const BODY_LIST_FIX_MODE As Long = 1
 
 Private Const wdNumberParagraph As Long = 1
@@ -193,6 +205,12 @@ Public Sub BuildProtocol()
     Dim tmpDir As String
     Dim bodyFiles() As String
     Dim appxFiles() As String
+
+    ' смещения таблиц каждой части в собранном документе
+    ' и число строк данных APPX_113b по каждому источнику
+    Dim bodyTblOffset() As Long
+    Dim appxTblOffset() As Long
+    Dim appxRows113b() As Long
     Dim approvalFile As String
     Dim titleFile As String
     Dim stylePath As String
@@ -244,6 +262,9 @@ Public Sub BuildProtocol()
 
     ReDim bodyFiles(1 To srcCount)
     ReDim appxFiles(1 To srcCount)
+    ReDim bodyTblOffset(1 To srcCount)
+    ReDim appxTblOffset(1 To srcCount)
+    ReDim appxRows113b(1 To srcCount)
 
     tmpDir = MakeTempDir()
     If tmpDir = "" Then
@@ -335,9 +356,16 @@ Public Sub BuildProtocol()
         Call Progress("источник " & i & " из " & srcCount & ": формирую основной раздел...")
         Set wdPart = wdApp.Documents.Add(Template:=bodyPath)
         Call BuildBodyDoc(wbMain, wbData, wdPart, srcNums(i), srcRows(i))
+
+        ' ВАЖЕН ПОРЯДОК: сначала превращаем автономера списка в текст,
+        ' и только потом правим коды разделов поиском/заменой.
+        ' Иначе Find/Replace не видит номера: у автонумерации нет текста,
+        ' и все разделы остаются 1.1.1 / 1.1.2.
+        If STRIP_LIST_NUMBERING_IN_BODY_TEXT Then Call ConvertListNumbersToText(wdPart)
+
         Call ApplyConfigScalars(wbMain, wdPart)
         Call FinalizeSectionNumbers(wdPart, srcNums(i))
-        Call ApplyBodyHardcode(wdPart)
+        Call ApplyBodyHardcodeAt(wdPart, 0)
         Call TrimTrailingEmptyParagraphs(wdPart)
         If COPY_STYLES_FROM_DONOR Then wdPart.CopyStylesFromTemplate stylePath
 
@@ -357,11 +385,16 @@ Public Sub BuildProtocol()
             End If
         End If
 
+        ' тот же порядок: сначала автономера в текст, потом замены
+        If STRIP_LIST_NUMBERING_IN_BODY_TEXT Then Call ConvertListNumbersToText(wdPart)
+
         Call ReplacePlaceholderInWord(wdPart, "{{КВАРТИРЫ_СЧЕТ}}", _
                                       CStr(CountVectorRows(wbMain, wbData, "APPX_112")))
         Call ApplyConfigScalars(wbMain, wdPart)
         Call FinalizeSectionNumbers(wdPart, srcNums(i))
-        Call ApplyAppendixHardcode(wdPart)
+
+        appxRows113b(i) = CountVectorRows(wbMain, wbData, "APPX_113b")
+        Call ApplyAppendixHardcodeAt(wdPart, 0, appxRows113b(i))
         Call TrimTrailingEmptyParagraphs(wdPart)
         If COPY_STYLES_FROM_DONOR Then wdPart.CopyStylesFromTemplate stylePath
 
@@ -404,6 +437,9 @@ Public Sub BuildProtocol()
 
     For i = 1 To srcCount
         Call Progress("сборка: основной раздел " & i & " из " & srcCount & "...")
+        ' запоминаем, сколько таблиц было ДО вставки части:
+        ' это смещение её таблиц в собранном документе
+        bodyTblOffset(i) = wdMaster.Tables.Count
         Call AppendPartToMaster(wdApp, wdMaster, bodyFiles(i), False)
     Next i
 
@@ -412,8 +448,20 @@ Public Sub BuildProtocol()
 
     For i = 1 To srcCount
         Call Progress("сборка: приложение " & i & " из " & srcCount & "...")
+        appxTblOffset(i) = wdMaster.Tables.Count
         Call AppendPartToMaster(wdApp, wdMaster, appxFiles(i), False)
     Next i
+
+    ' ---- 6a. Повторное оформление уже в собранном документе ----
+    ' Вставка через буфер пересчитывает таблицы под принимающую секцию,
+    ' поэтому кегель/отступ/автоподбор ставим второй раз по смещениям.
+    If HARDCODE_FORMATTING And REAPPLY_HARDCODE_AFTER_MERGE Then
+        Call Progress("сборка: финальное оформление таблиц...")
+        For i = 1 To srcCount
+            Call ApplyBodyHardcodeAt(wdMaster, bodyTblOffset(i))
+            Call ApplyAppendixHardcodeAt(wdMaster, appxTblOffset(i), appxRows113b(i))
+        Next i
+    End If
 
     ' ---- 7. Финальные скаляры + сохранение ----
     Call ApplyConfigScalars(wbMain, wdMaster)
@@ -945,43 +993,76 @@ End Sub
 ' ТОЧЕЧНЫЙ ХАРДКОД ОФОРМЛЕНИЯ
 ' ============================================================
 ' Основной раздел: кегель таблицы + снятие автонумерации с абзацев.
-Private Sub ApplyBodyHardcode(wdDoc As Object)
+Private Sub ApplyBodyHardcodeAt(wdDoc As Object, ByVal tblOffset As Long)
+
+    Dim c As Object
+    Dim idx As Long
 
     If Not HARDCODE_FORMATTING Then Exit Sub
 
     On Error Resume Next
 
-    If wdDoc.Tables.Count >= BODY_TABLE_INDEX Then
-        wdDoc.Tables(BODY_TABLE_INDEX).Range.Font.Size = BODY_TABLE_FONT_SIZE
+    idx = tblOffset + BODY_TABLE_INDEX
+
+    If wdDoc.Tables.Count >= idx Then
+        ' кегель ставим поячеечно: Table.Range.Font.Size молча не срабатывает
+        ' на таблицах с объединёнными ячейками
+        For Each c In wdDoc.Tables(idx).Range.Cells
+            c.Range.Font.Size = BODY_TABLE_FONT_SIZE
+        Next c
     End If
 
     Err.Clear
     On Error GoTo 0
 
-    If STRIP_LIST_NUMBERING_IN_BODY_TEXT Then Call StripListNumberingOutsideTables(wdDoc)
-
 End Sub
 
 
 ' Приложение: APPX_112 — кегель 9; APPX_113b — кегель 7 и левый отступ.
-Private Sub ApplyAppendixHardcode(wdDoc As Object)
+Private Sub ApplyAppendixHardcodeAt(wdDoc As Object, ByVal tblOffset As Long, _
+                                    ByVal rows113b As Long)
 
     Dim tbl As Object
+    Dim c As Object
+    Dim i As Long
+    Dim r As Long
+    Dim idx112 As Long
+    Dim idx113b As Long
 
     If Not HARDCODE_FORMATTING Then Exit Sub
 
     On Error Resume Next
 
+    idx112 = tblOffset + APPX_112_TABLE_INDEX
+    idx113b = tblOffset + APPX_113B_TABLE_INDEX
+
     ' --- APPX_112 ---
-    If wdDoc.Tables.Count >= APPX_112_TABLE_INDEX Then
-        wdDoc.Tables(APPX_112_TABLE_INDEX).Range.Font.Size = APPX_112_FONT_SIZE
+    ' кегель ставим поячеечно: Table.Range.Font.Size молча не срабатывает
+    ' на таблицах с объединёнными ячейками
+    If wdDoc.Tables.Count >= idx112 Then
+        For Each c In wdDoc.Tables(idx112).Range.Cells
+            c.Range.Font.Size = APPX_112_FONT_SIZE
+        Next c
     End If
 
     ' --- APPX_113b ---
-    If wdDoc.Tables.Count >= APPX_113B_TABLE_INDEX Then
+    If wdDoc.Tables.Count >= idx113b Then
 
-        Set tbl = wdDoc.Tables(APPX_113B_TABLE_INDEX)
-        tbl.Range.Font.Size = APPX_113B_FONT_SIZE
+        Set tbl = wdDoc.Tables(idx113b)
+        For Each c In tbl.Range.Cells
+            c.Range.Font.Size = APPX_113B_FONT_SIZE
+        Next c
+
+        ' нумерация первого столбца (аналогично механике боди)
+        If APPX_113B_WRITE_ROW_NUMBERS And rows113b > 0 Then
+            For i = 1 To rows113b
+                r = APPX_113B_DATA_ROW + i - 1
+                If tbl.Rows.Count >= r Then
+                    tbl.Cell(r, 1).Range.ListFormat.RemoveNumbers
+                    tbl.Cell(r, 1).Range.Text = CStr(i)
+                End If
+            Next i
+        End If
 
         ' левый отступ без пересчёта ширин колонок (RulerStyle:=wdAdjustNone)
         tbl.Rows.SetLeftIndent _
@@ -1001,13 +1082,17 @@ End Sub
 
 ' Снимает автонумерацию со всех абзацев вне таблиц.
 ' Текст и ручные номера вида "1.2.1." остаются как есть.
-Private Sub StripListNumberingOutsideTables(wdDoc As Object)
+Private Sub ConvertListNumbersToText(wdDoc As Object)
 
     Dim p As Object
+    Dim k As Long
 
     On Error Resume Next
 
-    For Each p In wdDoc.Paragraphs
+    ' идём с конца по индексам: преобразование меняет текст абзаца,
+    ' и For Each по живой коллекции может сбиться
+    For k = wdDoc.Paragraphs.Count To 1 Step -1
+        Set p = wdDoc.Paragraphs(k)
         If Not p.Range.Information(wdWithInTable) Then
             If p.Range.ListFormat.ListType <> 0 Then
                 If BODY_LIST_FIX_MODE = 2 Then
@@ -1017,7 +1102,8 @@ Private Sub StripListNumberingOutsideTables(wdDoc As Object)
                 End If
             End If
         End If
-    Next p
+        Set p = Nothing
+    Next k
 
     Err.Clear
     On Error GoTo 0
